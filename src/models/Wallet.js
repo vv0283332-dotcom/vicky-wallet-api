@@ -1,14 +1,22 @@
-class Wallet {
-  constructor({
-    id,
-    userId,
-    balance = 0
-  }) {
-    this.id = id;
-    this.userId = userId;
-    this.balance = balance;
-    this.createdAt = new Date().toISOString();
-  }
-}
+import mongoose from "mongoose";
 
-export default Wallet;
+const walletSchema = new mongoose.Schema(
+  {
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      unique: true
+    },
+
+    balance: {
+      type: Number,
+      default: 0
+    }
+  },
+  {
+    timestamps: true
+  }
+);
+
+export default mongoose.model("Wallet", walletSchema);

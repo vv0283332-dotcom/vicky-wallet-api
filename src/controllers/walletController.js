@@ -1,122 +1,184 @@
-import db from "../database/db.js";
 import Wallet from "../models/Wallet.js";
 import Transaction from "../models/Transaction.js";
 
 
 export async function getWallet(req,res){
 
-  await db.read();
+  try {
 
-  let wallet = db.data.wallets.find(
-    w => w.userId === req.user.id
-  );
-
-  if(!wallet){
-
-    wallet = new Wallet({
-      id: Date.now().toString(),
-      userId:req.user.id
+    let wallet = await Wallet.findOne({
+      user:req.user._id
     });
 
-    db.data.wallets.push(wallet);
-    await db.write();
+
+    if(!wallet){
+
+      wallet = await Wallet.create({
+        user:req.user._id,
+        balance:0
+      });
+
+    }
+
+
+    res.json(wallet);
+
+
+  } catch(error){
+
+    res.status(500).json({
+      message:error.message
+    });
+
   }
 
-
-  res.json(wallet);
 }
 
 
 
 export async function deposit(req,res){
 
-  const {amount} = req.body;
+  try {
 
-  await db.read();
-
-  let wallet = db.data.wallets.find(
-    w=>w.userId===req.user.id
-  );
+    const amount = Number(req.body.amount);
 
 
-  if(!wallet){
-    wallet=new Wallet({
-      id:Date.now().toString(),
-      userId:req.user.id
+    if(!amount || amount <= 0){
+
+      return res.status(400).json({
+        message:"Invalid amount"
+      });
+
+    }
+
+
+    let wallet = await Wallet.findOne({
+      user:req.user._id
     });
 
-    db.data.wallets.push(wallet);
+
+    if(!wallet){
+
+      wallet = await Wallet.create({
+        user:req.user._id,
+        balance:0
+      });
+
+    }
+
+
+    wallet.balance += amount;
+
+    await wallet.save();
+
+
+
+    await Transaction.create({
+
+      from:null,
+
+      to:req.user._id,
+
+      user:req.user._id,
+
+      amount,
+
+      type:"deposit",
+
+      description:"Wallet deposit"
+
+    });
+
+
+
+    res.json({
+
+      message:"Deposit successful",
+
+      balance:wallet.balance
+
+    });
+
+
+
+  } catch(error){
+
+    res.status(500).json({
+      message:error.message
+    });
+
   }
-
-
-  wallet.balance += Number(amount);
-
-
-  db.data.transactions.push(
-    new Transaction({
-      id:Date.now().toString(),
-      from:"SYSTEM",
-      to:req.user.id,
-      amount:Number(amount),
-      type:"deposit"
-    })
-  );
-
-
-  await db.write();
-
-
-  res.json({
-    message:"Deposit successful",
-    balance:wallet.balance
-  });
 
 }
 
 
 
+
+
 export async function withdraw(req,res){
 
- const {amount}=req.body;
-
- await db.read();
+  try {
 
 
- const wallet=db.data.wallets.find(
-  w=>w.userId===req.user.id
- );
+    const amount = Number(req.body.amount);
 
 
- if(!wallet || wallet.balance < amount){
-
-  return res.status(400).json({
-    message:"Insufficient balance"
-  });
-
- }
-
-
- wallet.balance -= Number(amount);
+    const wallet = await Wallet.findOne({
+      user:req.user._id
+    });
 
 
 
- db.data.transactions.push(
- new Transaction({
- id:Date.now().toString(),
- from:req.user.id,
- to:"SYSTEM",
- amount:Number(amount),
- type:"withdrawal"
- })
- );
+    if(!wallet || wallet.balance < amount){
+
+      return res.status(400).json({
+        message:"Insufficient balance"
+      });
+
+    }
 
 
- await db.write();
+
+    wallet.balance -= amount;
+
+    await wallet.save();
 
 
- res.json({
- message:"Withdrawal successful",
- balance:wallet.balance
- });
+
+    await Transaction.create({
+
+      from:req.user._id,
+
+      to:null,
+
+      user:req.user._id,
+
+      amount,
+
+      type:"withdrawal",
+
+      description:"Wallet withdrawal"
+
+    });
+
+
+
+    res.json({
+
+      message:"Withdrawal successful",
+
+      balance:wallet.balance
+
+    });
+
+
+
+  } catch(error){
+
+    res.status(500).json({
+      message:error.message
+    });
+
+  }
 
 }

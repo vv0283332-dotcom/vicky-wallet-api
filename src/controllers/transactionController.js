@@ -1,20 +1,39 @@
-import db from "../database/db.js";
+import Transaction from "../models/Transaction.js";
 
 
 export async function getTransactions(req,res){
 
-  await db.read();
+  try{
+
+    const transactions = await Transaction.find({
+      $or:[
+        {
+          from:req.user._id
+        },
+        {
+          to:req.user._id
+        },
+        {
+          user:req.user._id
+        }
+      ]
+    })
+    .sort({
+      createdAt:-1
+    });
 
 
-  const transactions = db.data.transactions.filter(
-    t =>
-      t.from === req.user.id ||
-      t.to === req.user.id
-  );
+    res.json({
+      transactions
+    });
 
 
-  res.json({
-    transactions
-  });
+  }catch(error){
+
+    res.status(500).json({
+      message:error.message
+    });
+
+  }
 
 }

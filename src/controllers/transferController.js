@@ -1,93 +1,79 @@
-import db from "../database/db.js";
+import User from "../models/User.js";
+import Wallet from "../models/Wallet.js";
 import Transaction from "../models/Transaction.js";
 
 
-export async function transfer(req, res) {
+export async function transfer(req,res){
 
-  try {
+  try{
 
     const { receiverEmail, amount } = req.body;
-
-
-    if (!receiverEmail || !amount) {
-      return res.status(400).json({
-        message: "Receiver and amount are required"
-      });
-    }
-
 
     const transferAmount = Number(amount);
 
 
-    if (transferAmount <= 0) {
+    if(!receiverEmail || !transferAmount || transferAmount <= 0){
+
       return res.status(400).json({
-        message: "Invalid amount"
+        message:"Receiver and valid amount are required"
       });
+
     }
 
 
-    await db.read();
+    const receiver = await User.findOne({
+      email: receiverEmail
+    });
 
 
-    const sender = db.data.users.find(
-      user => user.id === req.user.id
-    );
+    if(!receiver){
 
-
-    if (!sender) {
       return res.status(404).json({
-        message: "Sender not found"
+        message:"Receiver not found"
       });
+
     }
 
 
-    const receiver = db.data.users.find(
-      user => user.email === receiverEmail
-    );
+    if(receiver._id.toString() === req.user._id.toString()){
 
-
-    if (!receiver) {
-      return res.status(404).json({
-        message: "Receiver not found"
-      });
-    }
-
-
-    if (sender.id === receiver.id) {
       return res.status(400).json({
-        message: "Cannot transfer to yourself"
+        message:"Cannot transfer to yourself"
       });
+
     }
 
 
-    const senderWallet = db.data.wallets.find(
-      wallet => wallet.userId === sender.id
-    );
+
+    const senderWallet = await Wallet.findOne({
+      user:req.user._id
+    });
 
 
-    if (!senderWallet || senderWallet.balance < transferAmount) {
+    if(!senderWallet || senderWallet.balance < transferAmount){
+
       return res.status(400).json({
-        message: "Insufficient balance"
+        message:"Insufficient balance"
       });
+
     }
 
 
-    let receiverWallet = db.data.wallets.find(
-      wallet => wallet.userId === receiver.id
-    );
+
+    let receiverWallet = await Wallet.findOne({
+      user:receiver._id
+    });
 
 
-    if (!receiverWallet) {
+    if(!receiverWallet){
 
-      receiverWallet = {
-        id: Date.now().toString(),
-        userId: receiver.id,
-        balance: 0,
-        createdAt: new Date().toISOString()
-      };
+      receiverWallet = await Wallet.create({
+        user:receiver._id,
+        balance:0
+      });
 
-      db.data.wallets.push(receiverWallet);
     }
+
 
 
     senderWallet.balance -= transferAmount;
@@ -96,35 +82,46 @@ export async function transfer(req, res) {
 
 
 
-    db.data.transactions.push(
+    await senderWallet.save();
 
-      new Transaction({
-        id: Date.now().toString(),
-        from: sender.id,
-        to: receiver.id,
-        amount: transferAmount,
-        type: "transfer"
-      })
-
-    );
+    await receiverWallet.save();
 
 
-    await db.write();
 
+    await Transaction.create({
 
-    res.status(200).json({
+      from:req.user._id,
 
-      success: true,
-      message: "Transfer successful",
-      balance: senderWallet.balance
+      to:receiver._id,
+
+      user:req.user._id,
+
+      amount:transferAmount,
+
+      type:"transfer",
+
+      description:`Transfer to ${receiver.email}`
 
     });
 
 
-  } catch (error) {
+
+    res.json({
+
+      success:true,
+
+      message:"Transfer successful",
+
+      balance:senderWallet.balance
+
+    });
+
+
+
+  }catch(error){
 
     res.status(500).json({
-      message: error.message
+      message:error.message
     });
 
   }

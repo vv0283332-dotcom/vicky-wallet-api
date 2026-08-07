@@ -1,18 +1,37 @@
-class Transaction {
-  constructor({
-    id,
-    from,
-    to,
-    amount,
-    type
-  }) {
-    this.id = id;
-    this.from = from;
-    this.to = to;
-    this.amount = amount;
-    this.type = type;
-    this.createdAt = new Date().toISOString();
-  }
-}
+import mongoose from "mongoose";
 
-export default Transaction;
+const transactionSchema = new mongoose.Schema(
+  {
+    from: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+
+    to: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    },
+
+    amount: {
+      type: Number,
+      required: true
+    },
+
+    type: {
+      type: String,
+      required: true
+    },
+
+    description: String
+  },
+  {
+    timestamps: true
+  }
+);
+
+export default mongoose.model("Transaction", transactionSchema);
