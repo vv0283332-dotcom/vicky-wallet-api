@@ -34,7 +34,9 @@ app.use((req, res, next) => {
   next();
 });
 
-const db = new DatabaseSync("./data/vicky-wallet.sqlite");
+const dataDir = new URL("../data/", import.meta.url).pathname;
+await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
+const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
 
 db.exec(`
 PRAGMA journal_mode = WAL;
