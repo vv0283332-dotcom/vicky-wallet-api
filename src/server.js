@@ -652,6 +652,176 @@ app.get("/wallet/transactions", auth, (req, res) => {
   });
 });
 
+
+// ==================== OWNER / ADMIN API ====================
+
+function adminAuth(req, res, next) {
+  auth(req, res, () => {
+    const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+
+    if (!adminEmail) {
+      return res.status(503).json({
+        error: "Admin access is not configured"
+      });
+    }
+
+    if (String(req.user.email).toLowerCase() !== adminEmail) {
+      return res.status(403).json({
+        error: "Owner access required"
+      });
+    }
+
+    next();
+  });
+}
+
+app.get("/admin/stats", adminAuth, (req, res) => {
+  const users = db.prepare(`
+    SELECT COUNT(*) AS count FROM users
+  `).get();
+
+  const balances = db.prepare(`
+    SELECT COALESCE(SUM(balance), 0) AS total
+    FROM users
+  `).get();
+
+  const transactions = db.prepare(`
+    SELECT COUNT(*) AS count FROM transactions
+  `).get();
+
+  const deposits = db.prepare(`
+    SELECT
+      COUNT(*) AS count,
+      COALESCE(SUM(amount), 0) AS total
+    FROM transactions
+    WHERE type = 'deposit'
+  `).get();
+
+  const withdrawals = db.prepare(`
+    SELECT
+      COUNT(*) AS count,
+      COALESCE(SUM(amount), 0) AS total
+    FROM transactions
+    WHERE type = 'withdraw'
+  `).get();
+
+  const transfers = db.prepare(`
+    SELECT
+      COUNT(*) AS count,
+      COALESCE(SUM(amount), 0) AS total
+    FROM transactions
+    WHERE type IN ('transfer_sent', 'transfer_received')
+  `).get();
+
+  res.json({
+    users: Number(users.count),
+    total_balance: Number(balances.total),
+    transactions: Number(transactions.count),
+    deposits: {
+      count: Number(deposits.count),
+      total: Number(deposits.total)
+    },
+    withdrawals: {
+      count: Number(withdrawals.count),
+      total: Number(withdrawals.total)
+    },
+    transfers: {
+      count: Number(transfers.count),
+      total: Number(transfers.total)
+    }
+  });
+});
+
+app.get("/admin/users", adminAuth, (req, res) => {
+  const limit = Math.min(
+    Math.max(Number(req.query.limit) || 50, 1),
+    100
+  );
+
+  const users = db.prepare(`
+    SELECT id, full_name, email, currency, balance, created_at
+    FROM users
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(limit);
+
+  res.json({
+    users: users.map(user => ({
+      ...user,
+      balance: Number(user.balance)
+    }))
+  });
+});
+
+app.get("/admin/transactions", adminAuth, (req, res) => {
+  const limit = Math.min(
+    Math.max(Number(req.query.limit) || 100, 1),
+    200
+  );
+
+  const transactions = db.prepare(`
+    SELECT
+      t.id,
+      t.user_id,
+      u.full_name,
+      u.email,
+      t.type,
+      t.amount,
+      t.currency,
+      t.description,
+      t.related_user_id,
+      t.status,
+      t.created_at
+    FROM transactions t
+    LEFT JOIN users u ON u.id = t.user_id
+    ORDER BY t.created_at DESC
+    LIMIT ?
+  `).all(limit);
+
+  res.json({
+    transactions: transactions.map(item => ({
+      ...item,
+      amount: Number(item.amount)
+    }))
+  });
+});
+
+app.get("/admin/user/:id", adminAuth, (req, res) => {
+  const user = db.prepare(`
+    SELECT id, full_name, email, currency, balance, created_at
+    FROM users
+    WHERE id = ?
+  `).get(req.params.id);
+
+  if (!user) {
+    return res.status(404).json({
+      error: "User not found"
+    });
+  }
+
+  const transactions = db.prepare(`
+    SELECT
+      id, type, amount, currency,
+      description, related_user_id,
+      status, created_at
+    FROM transactions
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 100
+  `).all(user.id);
+
+  res.json({
+    user: {
+      ...user,
+      balance: Number(user.balance)
+    },
+    transactions: transactions.map(item => ({
+      ...item,
+      amount: Number(item.amount)
+    }))
+  });
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
