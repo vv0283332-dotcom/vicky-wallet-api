@@ -658,7 +658,7 @@ app.get("/wallet/transactions", auth, (req, res) => {
 // Remove this endpoint immediately after resetting the owner password.
 app.post("/admin/reset-owner-password", async (req, res) => {
   try {
-    const resetSecret = String(process.env.OWNER_RESET_SECRET || "");
+    const resetSecret = String(process.env.VICTOR || "");
     const suppliedSecret = String(req.body.reset_secret || "");
     const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
     const requestedEmail = email(req.body.email);
