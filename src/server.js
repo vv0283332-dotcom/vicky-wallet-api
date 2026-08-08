@@ -263,6 +263,103 @@ app.get("/auth/me", auth, (req, res) => {
   res.json({ user: userData(req.user) });
 });
 
+app.patch("/auth/profile", auth, async (req, res) => {
+  try {
+    const fullName = String(req.body.full_name || "").trim();
+    const newEmail = email(req.body.email);
+    const currency = String(req.body.currency || "").trim().toUpperCase();
+    const currentPassword = String(req.body.current_password || "");
+    const newPassword = String(req.body.new_password || "");
+
+    if (!fullName) {
+      return res.status(400).json({ error: "Full name is required" });
+    }
+
+    if (!newEmail || !newEmail.includes("@")) {
+      return res.status(400).json({ error: "Valid email is required" });
+    }
+
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      return res.status(400).json({
+        error: "Currency must be a 3-letter code"
+      });
+    }
+
+    const existingEmail = db.prepare(
+      "SELECT id FROM users WHERE email = ? AND id != ?"
+    ).get(newEmail, req.user.id);
+
+    if (existingEmail) {
+      return res.status(409).json({
+        error: "That email is already in use"
+      });
+    }
+
+    const user = db.prepare(
+      "SELECT * FROM users WHERE id = ?"
+    ).get(req.user.id);
+
+    let passwordHash = user.password_hash;
+
+    if (newPassword) {
+      if (!currentPassword) {
+        return res.status(400).json({
+          error: "Current password is required to change your password"
+        });
+      }
+
+      const valid = await bcrypt.compare(
+        currentPassword,
+        user.password_hash
+      );
+
+      if (!valid) {
+        return res.status(401).json({
+          error: "Current password is incorrect"
+        });
+      }
+
+      if (newPassword.length < 8) {
+        return res.status(400).json({
+          error: "New password must contain at least 8 characters"
+        });
+      }
+
+      passwordHash = await bcrypt.hash(newPassword, 12);
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET full_name = ?,
+          email = ?,
+          currency = ?,
+          password_hash = ?
+      WHERE id = ?
+    `).run(
+      fullName,
+      newEmail,
+      currency,
+      passwordHash,
+      req.user.id
+    );
+
+    const updatedUser = db.prepare(`
+      SELECT id, full_name, email, currency, balance, created_at
+      FROM users WHERE id = ?
+    `).get(req.user.id);
+
+    res.json({
+      message: "Profile updated successfully",
+      token: token(updatedUser),
+      user: userData(updatedUser)
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Profile update failed" });
+  }
+});
+
 app.post("/auth/logout", (req, res) => {
   res.clearCookie("token");
   res.json({ message: "Logged out" });
