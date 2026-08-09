@@ -654,69 +654,6 @@ app.get("/wallet/transactions", auth, (req, res) => {
 
 
 
-// TEMPORARY OWNER PASSWORD RESET
-// Remove this endpoint immediately after resetting the owner password.
-app.post("/admin/reset-owner-password", async (req, res) => {
-  try {
-    const resetSecret = String(process.env.VICTOR || "");
-    const suppliedSecret = String(req.body.reset_secret || "");
-    const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-    const requestedEmail = email(req.body.email);
-    const newPassword = String(req.body.new_password || "");
-
-    if (!resetSecret) {
-      return res.status(503).json({
-        error: "Owner reset is not configured"
-      });
-    }
-
-    if (!suppliedSecret || suppliedSecret !== resetSecret) {
-      return res.status(403).json({
-        error: "Invalid reset authorization"
-      });
-    }
-
-    if (!adminEmail || requestedEmail !== adminEmail) {
-      return res.status(403).json({
-        error: "Owner email required"
-      });
-    }
-
-    if (newPassword.length < 8) {
-      return res.status(400).json({
-        error: "New password must contain at least 8 characters"
-      });
-    }
-
-    const user = db.prepare(
-      "SELECT id FROM users WHERE email = ?"
-    ).get(adminEmail);
-
-    if (!user) {
-      return res.status(404).json({
-        error: "Owner account not found"
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-
-    db.prepare(`
-      UPDATE users
-      SET password_hash = ?
-      WHERE id = ?
-    `).run(passwordHash, user.id);
-
-    res.json({
-      message: "Owner password reset successfully"
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Owner password reset failed"
-    });
-  }
-});
-
 // ==================== OWNER / ADMIN API ====================
 
 function adminAuth(req, res, next) {
@@ -894,6 +831,43 @@ app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: "Internal server error" });
 });
+
+
+// ==================== ONE-TIME OWNER BOOTSTRAP ====================
+const bootstrapPassword = String(process.env.ADMIN_BOOTSTRAP_PASSWORD || "").trim();
+const bootstrapEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+
+if (bootstrapEmail && bootstrapPassword.length >= 8) {
+  const existingOwner = db.prepare(
+    "SELECT id FROM users WHERE email = ?"
+  ).get(bootstrapEmail);
+
+  const passwordHash = await bcrypt.hash(bootstrapPassword, 12);
+
+  if (existingOwner) {
+    db.prepare(`
+      UPDATE users
+      SET password_hash = ?
+      WHERE email = ?
+    `).run(passwordHash, bootstrapEmail);
+
+    console.log("🔐 Owner password bootstrapped");
+  } else {
+    db.prepare(`
+      INSERT INTO users
+      (id, full_name, email, password_hash, currency, balance, created_at)
+      VALUES (?, ?, ?, ?, 'USD', 0, ?)
+    `).run(
+      crypto.randomUUID(),
+      "Owner",
+      bootstrapEmail,
+      passwordHash,
+      new Date().toISOString()
+    );
+
+    console.log("👑 Owner account bootstrapped");
+  }
+}
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Vicky Wallet running on port ${PORT}`);
