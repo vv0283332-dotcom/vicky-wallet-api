@@ -148,6 +148,91 @@ ON transactions(user_id, created_at DESC);
 const id = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 
+const moveWalletFunds = db.transaction(({
+  senderId,
+  recipientId,
+  amount,
+  description = "Wallet transfer",
+  currency
+}) => {
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Invalid transfer amount");
+  }
+
+  const sender = db.prepare(`
+    SELECT id, account_id, balance, currency
+    FROM users
+    WHERE id = ?
+  `).get(senderId);
+
+  const recipient = db.prepare(`
+    SELECT id, account_id, full_name, balance, currency
+    FROM users
+    WHERE id = ?
+  `).get(recipientId);
+
+  if (!sender) throw new Error("Sender not found");
+  if (!recipient) throw new Error("Recipient not found");
+
+  if (sender.id === recipient.id) {
+    throw new Error("You cannot transfer to yourself");
+  }
+
+  if (Number(sender.balance) < amount) {
+    throw new Error("Insufficient balance");
+  }
+
+  const createdAt = now();
+  const sentId = id();
+  const receivedId = id();
+
+  db.prepare(`
+    UPDATE users
+    SET balance = balance - ?
+    WHERE id = ? AND balance >= ?
+  `).run(amount, sender.id, amount);
+
+  db.prepare(`
+    UPDATE users
+    SET balance = balance + ?
+    WHERE id = ?
+  `).run(amount, recipient.id);
+
+  db.prepare(`
+    INSERT INTO transactions
+    (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
+    VALUES (?, ?, 'transfer_sent', ?, ?, ?, ?, 'completed', ?)
+  `).run(
+    sentId,
+    sender.id,
+    amount,
+    currency || sender.currency,
+    description,
+    recipient.id,
+    createdAt
+  );
+
+  db.prepare(`
+    INSERT INTO transactions
+    (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
+    VALUES (?, ?, 'transfer_received', ?, ?, ?, ?, 'completed', ?)
+  `).run(
+    receivedId,
+    recipient.id,
+    amount,
+    currency || recipient.currency,
+    description,
+    sender.id,
+    createdAt
+  );
+
+  return {
+    transaction_id: sentId,
+    received_transaction_id: receivedId
+  };
+});
+
+
 function email(value) {
   return String(value || "").trim().toLowerCase();
 }
