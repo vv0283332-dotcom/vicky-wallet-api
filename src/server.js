@@ -1185,11 +1185,80 @@ app.post("/wallet/deposit", auth, (req, res) => {
 });
 
 app.post("/wallet/withdraw", auth, (req, res) => {
-  res.status(501).json({
-    error: "Real-money withdrawals are not enabled yet",
-    message:
-      "A verified payout provider must be configured before funds can leave the wallet."
-  });
+  try {
+    const value = Number(req.body.amount);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({
+        error: "Enter a valid withdrawal amount"
+      });
+    }
+
+    if (value > 100000000) {
+      return res.status(400).json({
+        error: "Withdrawal amount is too large"
+      });
+    }
+
+    const user = db.prepare(`
+      SELECT id, full_name, email, balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(req.user.id);
+
+    if (!user) {
+      return res.status(401).json({
+        error: "User account not found"
+      });
+    }
+
+    if (Number(user.balance) < value) {
+      return res.status(400).json({
+        error: "Insufficient balance"
+      });
+    }
+
+    const currency = String(
+      req.body.currency || user.currency || "USD"
+    ).trim().toUpperCase();
+
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      return res.status(400).json({
+        error: "Invalid currency"
+      });
+    }
+
+    const description = String(
+      req.body.description || "Wallet withdrawal"
+    ).trim();
+
+    const withdrawal = paymentService.createPaymentIntent({
+      userId: user.id,
+      provider: String(
+        req.body.provider || "flutterwave"
+      ).trim().toLowerCase(),
+      amount: value,
+      currency,
+      type: "withdrawal",
+      description: description || "Wallet withdrawal"
+    });
+
+    res.status(201).json({
+      message: "Withdrawal request created",
+      payment_id: withdrawal.id,
+      amount: value,
+      currency,
+      status: "pending",
+      balance: Number(user.balance),
+      description: description || "Wallet withdrawal"
+    });
+  } catch (error) {
+    console.error("Withdrawal initialization error:", error);
+
+    return res.status(400).json({
+      error: error.message || "Unable to create withdrawal"
+    });
+  }
 });
 
 
