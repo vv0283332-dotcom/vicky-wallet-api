@@ -114,6 +114,20 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user
+ON notifications(user_id, read, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS transactions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -192,6 +206,32 @@ ON transactions(user_id, created_at DESC);
 
 const id = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
+
+function createNotification({
+  userId,
+  type = "activity",
+  title,
+  message
+}) {
+  if (!userId || !title || !message) return null;
+
+  const notificationId = id();
+
+  db.prepare(`
+    INSERT INTO notifications
+    (id, user_id, type, title, message, read, created_at)
+    VALUES (?, ?, ?, ?, ?, 0, ?)
+  `).run(
+    notificationId,
+    userId,
+    String(type),
+    String(title),
+    String(message),
+    now()
+  );
+
+  return notificationId;
+}
 
 const moveWalletFunds = db.transaction(({
   senderId,
@@ -478,6 +518,13 @@ app.post("/auth/register", authLimiter, async (req, res) => {
       WHERE id = ?
     `).get(userId);
 
+    createNotification({
+      userId: user.id,
+      type: "account",
+      title: "Welcome to Vicky Pay",
+      message: "Your Vicky Pay account was created successfully."
+    });
+
     return res.status(201).json({
       message: "Registration successful",
       token: token(user),
@@ -529,6 +576,13 @@ app.post("/auth/login", authLimiter, async (req, res) => {
         error: "Invalid email or password"
       });
     }
+
+    createNotification({
+      userId: user.id,
+      type: "login",
+      title: "Login successful",
+      message: "You successfully signed in to Vicky Pay."
+    });
 
     return res.json({
       message: "Login successful",
@@ -966,6 +1020,13 @@ async function settleFlutterwaveDeposit({
 
     db.exec("COMMIT");
 
+    createNotification({
+      userId: user.id,
+      type: "deposit_completed",
+      title: "Deposit completed",
+      message: `Your ${expectedAmount} ${expectedCurrency} deposit has been credited to your wallet.`
+    });
+
     return {
       already_completed: false,
       payment_id: currentPayment.id,
@@ -1183,6 +1244,13 @@ app.post("/payments/deposit", auth, async (req, res) => {
         payment.id
       );
 
+      createNotification({
+        userId: req.user.id,
+        type: "deposit",
+        title: "Deposit started",
+        message: `Your ${payment.amount} ${payment.currency} deposit is being processed.`
+      });
+
       return res.status(201).json({
         message:
           "Deposit checkout created",
@@ -1286,6 +1354,13 @@ app.post("/wallet/withdraw", auth, (req, res) => {
       currency,
       type: "withdrawal",
       description: description || "Wallet withdrawal"
+    });
+
+    createNotification({
+      userId: user.id,
+      type: "withdrawal",
+      title: "Withdrawal request",
+      message: `Your withdrawal request for ${value} ${currency} was received.`
     });
 
     res.status(201).json({
@@ -1413,6 +1488,20 @@ app.post("/wallet/transfer", auth, (req, res) => {
       currency: sender.currency
     });
 
+    createNotification({
+      userId: sender.id,
+      type: "transfer_sent",
+      title: "Money sent",
+      message: `You sent ${value} ${sender.currency} to ${recipient.full_name}.`
+    });
+
+    createNotification({
+      userId: recipient.id,
+      type: "transfer_received",
+      title: "Money received",
+      message: `You received ${value} ${sender.currency} from ${sender.account_id}.`
+    });
+
     const updatedSender = db.prepare(`
       SELECT balance, currency
       FROM users
@@ -1447,6 +1536,89 @@ app.post("/wallet/transfer", auth, (req, res) => {
 
     return res.status(400).json({
       error: message
+    });
+  }
+});
+
+app.get("/notifications", auth, (req, res) => {
+  try {
+    const limit = Math.min(
+      Math.max(Number(req.query.limit) || 50, 1),
+      100
+    );
+
+    const notifications = db.prepare(`
+      SELECT id, type, title, message, read, created_at
+      FROM notifications
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(req.user.id, limit);
+
+    const unread = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM notifications
+      WHERE user_id = ?
+        AND read = 0
+    `).get(req.user.id);
+
+    return res.json({
+      notifications,
+      unread_count: Number(unread?.count || 0)
+    });
+  } catch (error) {
+    console.error("Notification load error:", error);
+    return res.status(500).json({
+      error: "Unable to load notifications"
+    });
+  }
+});
+
+app.patch("/notifications/:id/read", auth, (req, res) => {
+  try {
+    const result = db.prepare(`
+      UPDATE notifications
+      SET read = 1
+      WHERE id = ?
+        AND user_id = ?
+    `).run(
+      String(req.params.id),
+      req.user.id
+    );
+
+    if (!result.changes) {
+      return res.status(404).json({
+        error: "Notification not found"
+      });
+    }
+
+    return res.json({
+      message: "Notification marked as read"
+    });
+  } catch (error) {
+    console.error("Notification read error:", error);
+    return res.status(500).json({
+      error: "Unable to update notification"
+    });
+  }
+});
+
+app.post("/notifications/read-all", auth, (req, res) => {
+  try {
+    db.prepare(`
+      UPDATE notifications
+      SET read = 1
+      WHERE user_id = ?
+        AND read = 0
+    `).run(req.user.id);
+
+    return res.json({
+      message: "All notifications marked as read"
+    });
+  } catch (error) {
+    console.error("Notification read-all error:", error);
+    return res.status(500).json({
+      error: "Unable to update notifications"
     });
   }
 });
