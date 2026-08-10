@@ -9,6 +9,9 @@ import jwt from "jsonwebtoken";
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
 
+import { PaymentService } from "./payments/payment-service.js";
+import { WebhookService } from "./payments/webhook-service.js";
+import { MockProvider } from "./payments/providers/mock-provider.js";
 const app = express();
 
 const PORT = Number(process.env.PORT || 5000);
@@ -37,6 +40,13 @@ app.use((req, res, next) => {
 const dataDir = new URL("../data/", import.meta.url).pathname;
 await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
 const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
+const paymentProviders = {
+  mock: new MockProvider()
+};
+
+const paymentService = new PaymentService(db, paymentProviders);
+const webhookService = new WebhookService(db);
+
 
 db.exec(`
 PRAGMA journal_mode = WAL;
@@ -44,6 +54,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
+  account_id TEXT UNIQUE,
   full_name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL,
@@ -64,6 +75,65 @@ CREATE TABLE IF NOT EXISTS transactions (
   created_at TEXT NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS payment_intents (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_reference TEXT,
+  amount REAL NOT NULL,
+  currency TEXT NOT NULL,
+  type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','processing','completed','failed','cancelled')),
+  description TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_provider_reference
+ON payment_intents(provider, provider_reference)
+WHERE provider_reference IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_payment_intents_user
+ON payment_intents(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ledger_entries (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  payment_intent_id TEXT,
+  transaction_id TEXT,
+  entry_type TEXT NOT NULL CHECK(entry_type IN ('credit','debit')),
+  amount REAL NOT NULL,
+  currency TEXT NOT NULL,
+  description TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id),
+  FOREIGN KEY(payment_intent_id) REFERENCES payment_intents(id),
+  FOREIGN KEY(transaction_id) REFERENCES transactions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_user
+ON ledger_entries(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS payment_webhooks (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  provider_event_id TEXT,
+  event_type TEXT,
+  payload_hash TEXT NOT NULL,
+  processed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  processed_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_provider_event
+ON payment_webhooks(provider, provider_event_id)
+WHERE provider_event_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_payment_webhooks_hash
+ON payment_webhooks(payload_hash);
 
 CREATE INDEX IF NOT EXISTS idx_transactions_user
 ON transactions(user_id, created_at DESC);
@@ -92,6 +162,7 @@ function token(user) {
 function userData(user) {
   return {
     id: user.id,
+    account_id: user.account_id,
     full_name: user.full_name,
     email: user.email,
     currency: user.currency,
@@ -114,7 +185,7 @@ function auth(req, res, next) {
     const payload = jwt.verify(accessToken, JWT_SECRET);
 
     const user = db.prepare(`
-      SELECT id, full_name, email, currency, balance, created_at
+      SELECT id, account_id, full_name, email, currency, balance, created_at
       FROM users WHERE id = ?
     `).get(payload.sub);
 
@@ -145,6 +216,23 @@ app.get("/health", (req, res) => {
     time: now()
   });
 });
+
+
+function generateAccountId() {
+  let accountId;
+
+  do {
+    accountId =
+      "VW-" +
+      Math.floor(10000000 + Math.random() * 90000000);
+  } while (
+    db.prepare(
+      "SELECT 1 FROM users WHERE account_id = ?"
+    ).get(accountId)
+  );
+
+  return accountId;
+}
 
 app.post("/auth/register", async (req, res) => {
   try {
@@ -194,14 +282,16 @@ app.post("/auth/register", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 12);
     const userId = id();
+    const accountId = generateAccountId();
     const createdAt = now();
 
     db.prepare(`
       INSERT INTO users
-      (id, full_name, email, password_hash, currency, balance, created_at)
-      VALUES (?, ?, ?, ?, ?, 0, ?)
+      (id, account_id, full_name, email, password_hash, currency, balance, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?)
     `).run(
       userId,
+      accountId,
       fullName,
       userEmail,
       passwordHash,
@@ -210,7 +300,7 @@ app.post("/auth/register", async (req, res) => {
     );
 
     const user = db.prepare(`
-      SELECT id, full_name, email, currency, balance, created_at
+      SELECT id, account_id, full_name, email, currency, balance, created_at
       FROM users WHERE id = ?
     `).get(userId);
 
@@ -376,7 +466,69 @@ app.get("/wallet/balance", auth, (req, res) => {
   });
 });
 
-app.post("/wallet/deposit", auth, (req, res) => {
+// ==================== REAL-MONEY PAYMENT FLOW ====================
+// Deposits and withdrawals must be confirmed by a regulated payment
+// provider before the internal wallet balance is changed.
+//
+// These endpoints intentionally do NOT modify balance yet.
+
+app.post("/payments/test-intent", auth, async (req, res) => {
+  try {
+    const value = Number(req.body.amount);
+
+    if (!amount(value)) {
+      return res.status(400).json({
+        error: "Invalid payment amount"
+      });
+    }
+
+    const currency = String(
+      req.body.currency || req.user.currency || "USD"
+    ).trim().toUpperCase();
+
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      return res.status(400).json({
+        error: "Invalid currency"
+      });
+    }
+
+    const payment = paymentService.createPaymentIntent({
+      userId: req.user.id,
+      provider: "mock",
+      amount: value,
+      currency,
+      description: String(
+        req.body.description || "Payment engine test"
+      )
+    });
+
+    const provider = paymentService.getProvider("mock");
+
+    const checkout = await provider.createDeposit({
+      paymentId: payment.id,
+      amount: payment.amount,
+      currency: payment.currency
+    });
+
+    res.status(201).json({
+      message: "Payment engine test created",
+      payment_id: payment.id,
+      provider: checkout.provider,
+      provider_reference: checkout.provider_reference,
+      status: payment.status,
+      amount: payment.amount,
+      currency: payment.currency
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Payment engine test failed"
+    });
+  }
+});
+
+app.post("/payments/deposit", auth, (req, res) => {
   try {
     const value = Number(req.body.amount);
 
@@ -386,132 +538,118 @@ app.post("/wallet/deposit", auth, (req, res) => {
       });
     }
 
-    db.exec("BEGIN IMMEDIATE");
+    const currency = String(
+      req.body.currency || req.user.currency || "USD"
+    ).trim().toUpperCase();
 
-    try {
-      db.prepare(`
-        UPDATE users
-        SET balance = balance + ?
-        WHERE id = ?
-      `).run(value, req.user.id);
-
-      const transactionId = id();
-
-      db.prepare(`
-        INSERT INTO transactions
-        (id,user_id,type,amount,currency,description,status,created_at)
-        VALUES (?,?,'deposit',?,?,?,'completed',?)
-      `).run(
-        transactionId,
-        req.user.id,
-        value,
-        req.user.currency,
-        String(req.body.description || "Wallet deposit"),
-        now()
-      );
-
-      db.exec("COMMIT");
-
-      const updated = db.prepare(`
-        SELECT balance,currency FROM users WHERE id = ?
-      `).get(req.user.id);
-
-      res.status(201).json({
-        message: "Deposit successful",
-        balance: Number(updated.balance),
-        currency: updated.currency,
-        transaction_id: transactionId
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      return res.status(400).json({
+        error: "Invalid currency"
       });
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
     }
+
+    const paymentId = id();
+    const timestamp = now();
+
+    db.prepare(`
+      INSERT INTO payment_intents
+      (id, user_id, provider, amount, currency, type, status, description, created_at, updated_at)
+      VALUES (?, ?, 'pending_provider', ?, ?, 'deposit', 'pending', ?, ?, ?)
+    `).run(
+      paymentId,
+      req.user.id,
+      value,
+      currency,
+      String(req.body.description || "Wallet deposit"),
+      timestamp,
+      timestamp
+    );
+
+    res.status(201).json({
+      message: "Payment created",
+      payment_id: paymentId,
+      status: "pending",
+      amount: value,
+      currency
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Deposit failed" });
+    res.status(500).json({
+      error: "Unable to create payment"
+    });
   }
 });
 
+app.post("/wallet/deposit", auth, (req, res) => {
+  res.status(501).json({
+    error: "Real-money deposits are not enabled yet",
+    message: "Connect a verified payment provider before funding wallets."
+  });
+});
+
 app.post("/wallet/withdraw", auth, (req, res) => {
+  res.status(501).json({
+    error: "Real-money withdrawals are not enabled yet",
+    message: "Connect a verified payment provider before withdrawing funds."
+  });
+});
+
+
+app.get("/wallet/recipient/:accountId", auth, (req, res) => {
   try {
-    const value = Number(req.body.amount);
+    const accountId = String(req.params.accountId || "").trim().toUpperCase();
 
-    if (!amount(value)) {
+    if (!/^VW-[0-9]{8}$/.test(accountId)) {
       return res.status(400).json({
-        error: "Invalid withdrawal amount"
+        error: "Invalid Account ID"
       });
     }
 
-    db.exec("BEGIN IMMEDIATE");
-
-    try {
-      const user = db.prepare(`
-        SELECT balance,currency FROM users WHERE id = ?
-      `).get(req.user.id);
-
-      if (Number(user.balance) < value) {
-        db.exec("ROLLBACK");
-        return res.status(400).json({
-          error: "Insufficient balance"
-        });
-      }
-
-      db.prepare(`
-        UPDATE users
-        SET balance = balance - ?
-        WHERE id = ? AND balance >= ?
-      `).run(value, req.user.id, value);
-
-      const transactionId = id();
-
-      db.prepare(`
-        INSERT INTO transactions
-        (id,user_id,type,amount,currency,description,status,created_at)
-        VALUES (?,?,'withdrawal',?,?,?,'completed',?)
-      `).run(
-        transactionId,
-        req.user.id,
-        value,
-        user.currency,
-        String(req.body.description || "Wallet withdrawal"),
-        now()
-      );
-
-      db.exec("COMMIT");
-
-      const updated = db.prepare(`
-        SELECT balance,currency FROM users WHERE id = ?
-      `).get(req.user.id);
-
-      res.status(201).json({
-        message: "Withdrawal successful",
-        balance: Number(updated.balance),
-        currency: updated.currency,
-        transaction_id: transactionId
+    if (accountId === req.user.account_id) {
+      return res.status(400).json({
+        error: "You cannot select your own account"
       });
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
     }
+
+    const recipient = db.prepare(`
+      SELECT account_id, full_name, currency
+      FROM users
+      WHERE account_id = ?
+    `).get(accountId);
+
+    if (!recipient) {
+      return res.status(404).json({
+        error: "Recipient not found"
+      });
+    }
+
+    res.json({
+      account_id: recipient.account_id,
+      full_name: recipient.full_name,
+      currency: recipient.currency
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Withdrawal failed" });
+    res.status(500).json({
+      error: "Unable to find recipient"
+    });
   }
 });
 
 app.post("/wallet/transfer", auth, (req, res) => {
   try {
-    const recipientEmail = email(
-      req.body.recipient_email ||
-      req.body.recipientEmail ||
-      req.body.email
-    );
+    const recipientAccountId = String(
+      req.body.recipient_account_id ||
+      req.body.recipientAccountId ||
+      req.body.account_id ||
+      ""
+    ).trim().toUpperCase();
 
     const value = Number(req.body.amount);
 
-    if (!recipientEmail) {
+    if (!/^VW-[0-9]{8}$/.test(recipientAccountId)) {
       return res.status(400).json({
-        error: "Recipient email is required"
+        error: "Valid recipient Account ID is required"
       });
     }
 
@@ -521,7 +659,7 @@ app.post("/wallet/transfer", auth, (req, res) => {
       });
     }
 
-    if (recipientEmail === req.user.email) {
+    if (recipientAccountId === req.user.account_id) {
       return res.status(400).json({
         error: "You cannot transfer to yourself"
       });
@@ -536,9 +674,9 @@ app.post("/wallet/transfer", auth, (req, res) => {
       `).get(req.user.id);
 
       const recipient = db.prepare(`
-        SELECT id,balance,currency
-        FROM users WHERE email = ?
-      `).get(recipientEmail);
+        SELECT id,account_id,full_name,balance,currency
+        FROM users WHERE account_id = ?
+      `).get(recipientAccountId);
 
       if (!recipient) {
         db.exec("ROLLBACK");
@@ -855,10 +993,11 @@ if (bootstrapEmail && bootstrapPassword.length >= 8) {
   } else {
     db.prepare(`
       INSERT INTO users
-      (id, full_name, email, password_hash, currency, balance, created_at)
-      VALUES (?, ?, ?, ?, 'USD', 0, ?)
+      (id, account_id, full_name, email, password_hash, currency, balance, created_at)
+      VALUES (?, ?, ?, ?, ?, 'USD', 0, ?)
     `).run(
       crypto.randomUUID(),
+      generateAccountId(),
       "Owner",
       bootstrapEmail,
       passwordHash,
