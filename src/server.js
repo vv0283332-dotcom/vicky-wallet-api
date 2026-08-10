@@ -1263,105 +1263,77 @@ app.post("/wallet/transfer", auth, (req, res) => {
       });
     }
 
-    db.exec("BEGIN IMMEDIATE");
+    const recipient = db.prepare(`
+      SELECT id, account_id, full_name, currency
+      FROM users
+      WHERE account_id = ?
+    `).get(recipientAccountId);
 
-    try {
-      const sender = db.prepare(`
-        SELECT id,balance,currency
-        FROM users WHERE id = ?
-      `).get(req.user.id);
-
-      const recipient = db.prepare(`
-        SELECT id,account_id,full_name,balance,currency
-        FROM users WHERE account_id = ?
-      `).get(recipientAccountId);
-
-      if (!recipient) {
-        db.exec("ROLLBACK");
-        return res.status(404).json({
-          error: "Recipient not found"
-        });
-      }
-
-      if (sender.currency !== recipient.currency) {
-        db.exec("ROLLBACK");
-        return res.status(400).json({
-          error: "Currencies must match"
-        });
-      }
-
-      if (Number(sender.balance) < value) {
-        db.exec("ROLLBACK");
-        return res.status(400).json({
-          error: "Insufficient balance"
-        });
-      }
-
-      db.prepare(`
-        UPDATE users
-        SET balance = balance - ?
-        WHERE id = ? AND balance >= ?
-      `).run(value, sender.id, value);
-
-      db.prepare(`
-        UPDATE users
-        SET balance = balance + ?
-        WHERE id = ?
-      `).run(value, recipient.id);
-
-      const transferId = id();
-      const createdAt = now();
-      const description = String(
-        req.body.description || "Wallet transfer"
-      );
-
-      db.prepare(`
-        INSERT INTO transactions
-        (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
-        VALUES (?,?,'transfer_sent',?,?,?,?, 'completed',?)
-      `).run(
-        transferId,
-        sender.id,
-        value,
-        sender.currency,
-        description,
-        recipient.id,
-        createdAt
-      );
-
-      db.prepare(`
-        INSERT INTO transactions
-        (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
-        VALUES (?,?,'transfer_received',?,?,?,?, 'completed',?)
-      `).run(
-        id(),
-        recipient.id,
-        value,
-        recipient.currency,
-        description,
-        sender.id,
-        createdAt
-      );
-
-      db.exec("COMMIT");
-
-      const updated = db.prepare(`
-        SELECT balance,currency FROM users WHERE id = ?
-      `).get(sender.id);
-
-      res.status(201).json({
-        message: "Transfer successful",
-        transaction_id: transferId,
-        balance: Number(updated.balance),
-        currency: updated.currency
+    if (!recipient) {
+      return res.status(404).json({
+        error: "Recipient not found"
       });
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
     }
+
+    const sender = db.prepare(`
+      SELECT id, account_id, balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(req.user.id);
+
+    if (!sender) {
+      return res.status(401).json({
+        error: "User account not found"
+      });
+    }
+
+    const description = String(
+      req.body.description || "Wallet transfer"
+    ).trim();
+
+    const result = moveWalletFunds({
+      senderId: sender.id,
+      recipientId: recipient.id,
+      amount: value,
+      description: description || "Wallet transfer",
+      currency: sender.currency
+    });
+
+    const updatedSender = db.prepare(`
+      SELECT balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(sender.id);
+
+    res.status(201).json({
+      message: "Transfer successful",
+      transaction_id: result.transaction_id,
+      balance: Number(updatedSender.balance),
+      currency: updatedSender.currency,
+      recipient: {
+        account_id: recipient.account_id,
+        full_name: recipient.full_name
+      },
+      amount: value,
+      status: "completed"
+    });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Transfer failed" });
+    console.error("Wallet transfer error:", error);
+
+    const message = error.message || "Transfer failed";
+
+    if (
+      message === "Insufficient balance" ||
+      message === "You cannot transfer to yourself"
+    ) {
+      return res.status(400).json({
+        error: message
+      });
+    }
+
+    return res.status(400).json({
+      error: message
+    });
   }
 });
 
