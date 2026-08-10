@@ -246,7 +246,10 @@ app.post("/auth/register", async (req, res) => {
       req.body.full_name || req.body.fullName || ""
     ).trim();
 
-    const userEmail = email(req.body.email);
+    const userEmail = String(
+      email(req.body.email)
+    ).trim().toLowerCase();
+
     const password = String(req.body.password || "");
 
     const currency = String(
@@ -257,11 +260,15 @@ app.post("/auth/register", async (req, res) => {
     ).trim().toUpperCase();
 
     if (!fullName) {
-      return res.status(400).json({ error: "Full name is required" });
+      return res.status(400).json({
+        error: "Full name is required"
+      });
     }
 
-    if (!userEmail.includes("@")) {
-      return res.status(400).json({ error: "Valid email is required" });
+    if (!userEmail || !userEmail.includes("@")) {
+      return res.status(400).json({
+        error: "Valid email is required"
+      });
     }
 
     if (password.length < 8) {
@@ -277,7 +284,7 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const existing = db.prepare(
-      "SELECT id FROM users WHERE email = ?"
+      "SELECT id FROM users WHERE lower(email) = lower(?) LIMIT 1"
     ).get(userEmail);
 
     if (existing) {
@@ -291,52 +298,101 @@ app.post("/auth/register", async (req, res) => {
     const accountId = generateAccountId();
     const createdAt = now();
 
-    db.prepare(`
-      INSERT INTO users
-      (id, account_id, full_name, email, password_hash, currency, balance, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-    `).run(
-      userId,
-      accountId,
-      fullName,
-      userEmail,
-      passwordHash,
-      currency,
-      createdAt
-    );
+    try {
+      db.prepare(`
+        INSERT INTO users
+        (
+          id,
+          account_id,
+          full_name,
+          email,
+          password_hash,
+          currency,
+          balance,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(
+        userId,
+        accountId,
+        fullName,
+        userEmail,
+        passwordHash,
+        currency,
+        createdAt
+      );
+    } catch (insertError) {
+      if (
+        String(insertError?.message || "")
+          .toLowerCase()
+          .includes("unique")
+      ) {
+        return res.status(409).json({
+          error: "An account with this email already exists"
+        });
+      }
+
+      throw insertError;
+    }
 
     const user = db.prepare(`
-      SELECT id, account_id, full_name, email, currency, balance, created_at
-      FROM users WHERE id = ?
+      SELECT
+        id,
+        account_id,
+        full_name,
+        email,
+        currency,
+        balance,
+        created_at
+      FROM users
+      WHERE id = ?
     `).get(userId);
 
-    res.status(201).json({
+    return res.status(201).json({
       message: "Registration successful",
       token: token(user),
       user: userData(user)
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Registration failed" });
+    console.error("Registration error:", error);
+
+    return res.status(500).json({
+      error: "Registration failed"
+    });
   }
 });
 
 app.post("/auth/login", async (req, res) => {
   try {
-    const userEmail = email(req.body.email);
+    const userEmail = String(
+      email(req.body.email)
+    ).trim().toLowerCase();
+
     const password = String(req.body.password || "");
 
-    const user = db.prepare(
-      "SELECT * FROM users WHERE email = ?"
-    ).get(userEmail);
-
-    if (!user) {
+    if (!userEmail || !userEmail.includes("@") || !password) {
       return res.status(401).json({
         error: "Invalid email or password"
       });
     }
 
-    const valid = await bcrypt.compare(password, user.password_hash);
+    const user = db.prepare(`
+      SELECT *
+      FROM users
+      WHERE lower(email) = lower(?)
+      LIMIT 1
+    `).get(userEmail);
+
+    if (!user || !user.password_hash) {
+      return res.status(401).json({
+        error: "Invalid email or password"
+      });
+    }
+
+    const valid = await bcrypt.compare(
+      password,
+      user.password_hash
+    );
 
     if (!valid) {
       return res.status(401).json({
@@ -344,14 +400,17 @@ app.post("/auth/login", async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       message: "Login successful",
       token: token(user),
       user: userData(user)
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Login failed" });
+    console.error("Login error:", error);
+
+    return res.status(500).json({
+      error: "Login failed"
+    });
   }
 });
 
