@@ -15,6 +15,51 @@ import { MockProvider } from "./payments/providers/mock-provider.js";
 import { FlutterwaveProvider } from "./payments/providers/flutterwave-provider.js";
 const app = express();
 
+/* ================= SECURITY HARDENING ================= */
+
+app.disable("x-powered-by");
+
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}));
+
+app.use(express.json({
+  limit: "100kb",
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
+
+app.use(express.urlencoded({
+  extended: false,
+  limit: "50kb"
+}));
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: {
+    error: "Too many requests. Please try again later."
+  }
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: {
+    error: "Too many authentication attempts. Please try again later."
+  }
+});
+
+app.use(globalLimiter);
+
+
 const PORT = Number(process.env.PORT || 5000);
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -325,7 +370,7 @@ function generateAccountId() {
   return accountId;
 }
 
-app.post("/auth/register", async (req, res) => {
+app.post("/auth/register", authLimiter, async (req, res) => {
   try {
     const fullName = String(
       req.body.full_name || req.body.fullName || ""
@@ -447,7 +492,7 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", authLimiter, async (req, res) => {
   try {
     const userEmail = String(
       email(req.body.email)
