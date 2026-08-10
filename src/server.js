@@ -338,7 +338,7 @@ function auth(req, res, next) {
 
 app.get("/", (req, res) => {
   res.json({
-    name: "Vicky Wallet API",
+    name: "Vicky Pay API",
     status: "online",
     database: "SQLite",
     version: "2.0.0"
@@ -1693,7 +1693,7 @@ if (bootstrapEmail && bootstrapPassword.length >= 8) {
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Vicky Wallet running on port ${PORT}`);
+  console.log(`🚀 Vicky Pay running on port ${PORT}`);
   console.log(`🗄️ SQLite database: data/vicky-wallet.sqlite`);
   console.log(`🔐 JWT authentication enabled`);
 });

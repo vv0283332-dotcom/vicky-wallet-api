@@ -82,7 +82,7 @@ export class FlutterwaveProvider extends PaymentProvider {
           name
         },
         customizations: {
-          title: "Vicky Wallet",
+          title: "Vicky Pay",
           description: "Wallet deposit"
         }
       })
