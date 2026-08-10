@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import { PaymentService } from "./payments/payment-service.js";
 import { WebhookService } from "./payments/webhook-service.js";
 import { MockProvider } from "./payments/providers/mock-provider.js";
+import { FlutterwaveProvider } from "./payments/providers/flutterwave-provider.js";
 const app = express();
 
 const PORT = Number(process.env.PORT || 5000);
@@ -41,7 +42,8 @@ const dataDir = new URL("../data/", import.meta.url).pathname;
 await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
 const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
 const paymentProviders = {
-  mock: new MockProvider()
+  mock: new MockProvider(),
+  flutterwave: new FlutterwaveProvider()
 };
 
 const paymentService = new PaymentService(db, paymentProviders);
@@ -466,11 +468,9 @@ app.get("/wallet/balance", auth, (req, res) => {
   });
 });
 
-// ==================== REAL-MONEY PAYMENT FLOW ====================
-// Deposits and withdrawals must be confirmed by a regulated payment
-// provider before the internal wallet balance is changed.
-//
-// These endpoints intentionally do NOT modify balance yet.
+// ==================== PAYMENT FLOW ====================
+// Provider-backed payment intents.
+// Wallet balances are changed only after verified provider settlement.
 
 app.post("/payments/test-intent", auth, async (req, res) => {
   try {
@@ -497,6 +497,7 @@ app.post("/payments/test-intent", auth, async (req, res) => {
       provider: "mock",
       amount: value,
       currency,
+      type: "deposit",
       description: String(
         req.body.description || "Payment engine test"
       )
@@ -510,14 +511,21 @@ app.post("/payments/test-intent", auth, async (req, res) => {
       currency: payment.currency
     });
 
+    paymentService.setProviderReference(
+      payment.id,
+      checkout.provider_reference
+    );
+
+    const updated = paymentService.getPaymentIntent(payment.id);
+
     res.status(201).json({
       message: "Payment engine test created",
-      payment_id: payment.id,
+      payment_id: updated.id,
       provider: checkout.provider,
       provider_reference: checkout.provider_reference,
-      status: payment.status,
-      amount: payment.amount,
-      currency: payment.currency
+      status: updated.status,
+      amount: updated.amount,
+      currency: updated.currency
     });
   } catch (error) {
     console.error(error);
@@ -528,7 +536,79 @@ app.post("/payments/test-intent", auth, async (req, res) => {
   }
 });
 
-app.post("/payments/deposit", auth, (req, res) => {
+app.post("/payments/webhook/flutterwave", (req, res) => {
+  try {
+    const secretHash = String(
+      process.env.FLW_SECRET_HASH || ""
+    ).trim();
+
+    if (!secretHash) {
+      return res.status(503).json({
+        error: "Webhook secret is not configured"
+      });
+    }
+
+    const incomingHash = String(
+      req.headers["verif-hash"] || ""
+    ).trim();
+
+    if (!incomingHash || incomingHash !== secretHash) {
+      return res.status(401).json({
+        error: "Invalid webhook signature"
+      });
+    }
+
+    const eventId = String(
+      req.body?.id ||
+      req.body?.data?.id ||
+      req.body?.data?.tx_ref ||
+      ""
+    ).trim();
+
+    const eventType = String(
+      req.body?.event ||
+      req.body?.type ||
+      ""
+    ).trim();
+
+    const payloadHash = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(req.body || {}))
+      .digest("hex");
+
+    if (webhookService.alreadyProcessed("flutterwave", eventId)) {
+      return res.status(200).json({
+        received: true,
+        duplicate: true
+      });
+    }
+
+    webhookService.recordWebhook({
+      id: id(),
+      provider: "flutterwave",
+      eventId: eventId || null,
+      eventType: eventType || null,
+      payloadHash
+    });
+
+    console.log("Flutterwave webhook received:", {
+      eventId,
+      eventType
+    });
+
+    return res.status(200).json({
+      received: true
+    });
+  } catch (error) {
+    console.error("Flutterwave webhook error:", error);
+
+    return res.status(500).json({
+      error: "Webhook processing failed"
+    });
+  }
+});
+
+app.post("/payments/deposit", auth, async (req, res) => {
   try {
     const value = Number(req.body.amount);
 
@@ -548,34 +628,60 @@ app.post("/payments/deposit", auth, (req, res) => {
       });
     }
 
-    const paymentId = id();
-    const timestamp = now();
+    const providerName = String(
+      req.body.provider || "flutterwave"
+    ).trim().toLowerCase();
+
+    const provider = paymentService.getProvider(providerName);
+
+    const payment = paymentService.createPaymentIntent({
+      userId: req.user.id,
+      provider: providerName,
+      amount: value,
+      currency,
+      description: String(
+        req.body.description || "Wallet deposit"
+      )
+    });
+
+    const checkout = await provider.createDeposit({
+      paymentId: payment.id,
+      amount: payment.amount,
+      currency: payment.currency,
+      email: req.user.email,
+      name: req.user.full_name,
+      redirectUrl:
+        process.env.PAYMENT_REDIRECT_URL ||
+        "https://vicky-wallet-frontend.onrender.com/payment/callback"
+    });
 
     db.prepare(`
-      INSERT INTO payment_intents
-      (id, user_id, provider, amount, currency, type, status, description, created_at, updated_at)
-      VALUES (?, ?, 'pending_provider', ?, ?, 'deposit', 'pending', ?, ?, ?)
+      UPDATE payment_intents
+      SET provider_reference = ?,
+          status = 'pending',
+          updated_at = ?
+      WHERE id = ?
     `).run(
-      paymentId,
-      req.user.id,
-      value,
-      currency,
-      String(req.body.description || "Wallet deposit"),
-      timestamp,
-      timestamp
+      checkout.provider_reference || null,
+      now(),
+      payment.id
     );
 
     res.status(201).json({
-      message: "Payment created",
-      payment_id: paymentId,
+      message: "Deposit checkout created",
+      payment_id: payment.id,
+      provider: checkout.provider,
+      provider_reference: checkout.provider_reference,
+      checkout_url: checkout.checkout_url,
       status: "pending",
-      amount: value,
-      currency
+      amount: payment.amount,
+      currency: payment.currency
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Unable to create payment"
+    console.error("Deposit initialization error:", error);
+
+    res.status(400).json({
+      error: error.message || "Unable to initialize deposit"
     });
   }
 });
@@ -583,14 +689,16 @@ app.post("/payments/deposit", auth, (req, res) => {
 app.post("/wallet/deposit", auth, (req, res) => {
   res.status(501).json({
     error: "Real-money deposits are not enabled yet",
-    message: "Connect a verified payment provider before funding wallets."
+    message:
+      "A verified payment provider must be configured before wallet balances can be funded."
   });
 });
 
 app.post("/wallet/withdraw", auth, (req, res) => {
   res.status(501).json({
     error: "Real-money withdrawals are not enabled yet",
-    message: "Connect a verified payment provider before withdrawing funds."
+    message:
+      "A verified payout provider must be configured before funds can leave the wallet."
   });
 });
 
