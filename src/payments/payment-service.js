@@ -38,6 +38,8 @@ export class PaymentService {
       throw new Error("Invalid payment type");
     }
 
+    currency = String(currency || "").trim().toUpperCase();
+
     if (!/^[A-Z]{3}$/.test(currency)) {
       throw new Error("Invalid currency");
     }

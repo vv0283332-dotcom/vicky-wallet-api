@@ -24,7 +24,11 @@ if (!JWT_SECRET) {
 
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(morgan("combined"));
@@ -536,47 +540,307 @@ app.post("/payments/test-intent", auth, async (req, res) => {
   }
 });
 
-app.post("/payments/webhook/flutterwave", (req, res) => {
-  try {
-    const secretHash = String(
-      process.env.FLW_SECRET_HASH || ""
-    ).trim();
+async function settleFlutterwaveDeposit({
+  transactionId,
+  txRef
+}) {
+  const provider = paymentService.getProvider("flutterwave");
 
-    if (!secretHash) {
-      return res.status(503).json({
-        error: "Webhook secret is not configured"
-      });
+  let verification;
+
+  if (transactionId) {
+    verification = await provider.verifyPayment(
+      transactionId
+    );
+  } else {
+    throw new Error(
+      "Flutterwave transaction ID is missing"
+    );
+  }
+
+  if (!verification.verified) {
+    throw new Error(
+      verification.reason ||
+      "Flutterwave payment could not be verified"
+    );
+  }
+
+  const payment = db.prepare(`
+    SELECT *
+    FROM payment_intents
+    WHERE provider = 'flutterwave'
+      AND (
+        provider_reference = ?
+        OR provider_reference = ?
+      )
+    LIMIT 1
+  `).get(
+    txRef || "",
+    verification.provider_reference || ""
+  );
+
+  if (!payment) {
+    throw new Error(
+      "Payment intent not found"
+    );
+  }
+
+  if (payment.type !== "deposit") {
+    throw new Error(
+      "Payment intent is not a deposit"
+    );
+  }
+
+  if (payment.status === "completed") {
+    return {
+      already_completed: true,
+      payment
+    };
+  }
+
+  const verifiedAmount =
+    Number(verification.amount);
+
+  const expectedAmount =
+    Number(payment.amount);
+
+  const verifiedCurrency =
+    String(
+      verification.currency || ""
+    ).toUpperCase();
+
+  const expectedCurrency =
+    String(
+      payment.currency || ""
+    ).toUpperCase();
+
+  if (
+    Math.abs(verifiedAmount - expectedAmount) >
+    0.000001
+  ) {
+    throw new Error(
+      "Verified payment amount does not match payment intent"
+    );
+  }
+
+  if (
+    verifiedCurrency !== expectedCurrency
+  ) {
+    throw new Error(
+      "Verified payment currency does not match payment intent"
+    );
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+
+  try {
+    const currentPayment = db.prepare(`
+      SELECT *
+      FROM payment_intents
+      WHERE id = ?
+    `).get(payment.id);
+
+    if (!currentPayment) {
+      throw new Error(
+        "Payment intent disappeared"
+      );
     }
 
-    const incomingHash = String(
-      req.headers["verif-hash"] || ""
-    ).trim();
+    if (currentPayment.status === "completed") {
+      db.exec("COMMIT");
 
-    if (!incomingHash || incomingHash !== secretHash) {
+      return {
+        already_completed: true,
+        payment: currentPayment
+      };
+    }
+
+    const user = db.prepare(`
+      SELECT id, balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(currentPayment.user_id);
+
+    if (!user) {
+      throw new Error(
+        "Payment owner not found"
+      );
+    }
+
+    /*
+     * Idempotency guard:
+     * if this payment intent already has a credit
+     * ledger entry, do not credit the wallet again.
+     */
+    const existingCredit = db.prepare(`
+      SELECT id
+      FROM ledger_entries
+      WHERE payment_intent_id = ?
+        AND entry_type = 'credit'
+      LIMIT 1
+    `).get(currentPayment.id);
+
+    if (existingCredit) {
+      db.prepare(`
+        UPDATE payment_intents
+        SET status = 'completed',
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        now(),
+        currentPayment.id
+      );
+
+      db.exec("COMMIT");
+
+      return {
+        already_completed: true,
+        payment: db.prepare(`
+          SELECT *
+          FROM payment_intents
+          WHERE id = ?
+        `).get(currentPayment.id)
+      };
+    }
+
+    const transactionIdNew = id();
+    const createdAt = now();
+
+    db.prepare(`
+      UPDATE users
+      SET balance = balance + ?
+      WHERE id = ?
+    `).run(
+      expectedAmount,
+      user.id
+    );
+
+    db.prepare(`
+      INSERT INTO transactions
+      (
+        id,
+        user_id,
+        type,
+        amount,
+        currency,
+        description,
+        related_user_id,
+        status,
+        created_at
+      )
+      VALUES (?, ?, 'deposit', ?, ?, ?, NULL, 'completed', ?)
+    `).run(
+      transactionIdNew,
+      user.id,
+      expectedAmount,
+      expectedCurrency,
+      currentPayment.description ||
+        "Wallet deposit",
+      createdAt
+    );
+
+    db.prepare(`
+      INSERT INTO ledger_entries
+      (
+        id,
+        user_id,
+        payment_intent_id,
+        transaction_id,
+        entry_type,
+        amount,
+        currency,
+        description,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, 'credit', ?, ?, ?, ?)
+    `).run(
+      id(),
+      user.id,
+      currentPayment.id,
+      transactionIdNew,
+      expectedAmount,
+      expectedCurrency,
+      currentPayment.description ||
+        "Flutterwave wallet deposit",
+      createdAt
+    );
+
+    db.prepare(`
+      UPDATE payment_intents
+      SET status = 'completed',
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      createdAt,
+      currentPayment.id
+    );
+
+    db.exec("COMMIT");
+
+    return {
+      already_completed: false,
+      payment_id: currentPayment.id,
+      transaction_id: transactionIdNew,
+      amount: expectedAmount,
+      currency: expectedCurrency
+    };
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+
+    throw error;
+  }
+}
+
+app.post("/payments/webhook/flutterwave", async (req, res) => {
+  try {
+    const provider =
+      paymentService.getProvider("flutterwave");
+
+    const validWebhook =
+      provider.verifyWebhook({
+        verifHash:
+          req.headers["verif-hash"],
+        flutterwaveSignature:
+          req.headers["flutterwave-signature"],
+        rawBody:
+          req.rawBody
+      });
+
+    if (!validWebhook) {
       return res.status(401).json({
         error: "Invalid webhook signature"
       });
     }
 
+    const payload = req.body || {};
+
     const eventId = String(
-      req.body?.id ||
-      req.body?.data?.id ||
-      req.body?.data?.tx_ref ||
+      payload.id ||
+      payload.webhook_id ||
+      payload.data?.id ||
+      payload.data?.tx_ref ||
       ""
     ).trim();
 
     const eventType = String(
-      req.body?.event ||
-      req.body?.type ||
+      payload.type ||
+      payload.event ||
       ""
     ).trim();
 
     const payloadHash = crypto
       .createHash("sha256")
-      .update(JSON.stringify(req.body || {}))
+      .update(JSON.stringify(payload))
       .digest("hex");
 
-    if (webhookService.alreadyProcessed("flutterwave", eventId)) {
+    if (
+      webhookService.alreadyProcessed(
+        "flutterwave",
+        eventId
+      )
+    ) {
       return res.status(200).json({
         received: true,
         duplicate: true
@@ -591,16 +855,63 @@ app.post("/payments/webhook/flutterwave", (req, res) => {
       payloadHash
     });
 
-    console.log("Flutterwave webhook received:", {
-      eventId,
-      eventType
-    });
+    const transactionId =
+      payload.data?.id;
+
+    const txRef =
+      payload.data?.tx_ref ||
+      payload.data?.reference ||
+      "";
+
+    if (
+      eventType === "charge.completed" ||
+      String(payload.data?.status || "").toLowerCase() ===
+        "successful"
+    ) {
+      try {
+        await settleFlutterwaveDeposit({
+          transactionId,
+          txRef
+        });
+      } catch (error) {
+        console.error(
+          "Flutterwave settlement error:",
+          error.message
+        );
+
+        return res.status(200).json({
+          received: true,
+          processed: false,
+          error: error.message
+        });
+      }
+    }
+
+    db.prepare(`
+      UPDATE payment_webhooks
+      SET processed = 1,
+          processed_at = ?
+      WHERE provider = ?
+        AND (
+          provider_event_id = ?
+          OR payload_hash = ?
+        )
+    `).run(
+      now(),
+      "flutterwave",
+      eventId || null,
+      payloadHash
+    );
 
     return res.status(200).json({
-      received: true
+      received: true,
+      processed: true
     });
   } catch (error) {
-    console.error("Flutterwave webhook error:", error);
+    console.error(
+      "Flutterwave webhook error:",
+      error
+    );
 
     return res.status(500).json({
       error: "Webhook processing failed"
@@ -612,14 +923,16 @@ app.post("/payments/deposit", auth, async (req, res) => {
   try {
     const value = Number(req.body.amount);
 
-    if (!amount(value)) {
+    if (!paymentService.validateAmount(value)) {
       return res.status(400).json({
         error: "Invalid deposit amount"
       });
     }
 
     const currency = String(
-      req.body.currency || req.user.currency || "USD"
+      req.body.currency ||
+      req.user.currency ||
+      "USD"
     ).trim().toUpperCase();
 
     if (!/^[A-Z]{3}$/.test(currency)) {
@@ -629,59 +942,92 @@ app.post("/payments/deposit", auth, async (req, res) => {
     }
 
     const providerName = String(
-      req.body.provider || "flutterwave"
+      req.body.provider ||
+      "flutterwave"
     ).trim().toLowerCase();
 
-    const provider = paymentService.getProvider(providerName);
+    if (providerName !== "flutterwave") {
+      return res.status(400).json({
+        error: "Only Flutterwave deposits are enabled"
+      });
+    }
 
-    const payment = paymentService.createPaymentIntent({
-      userId: req.user.id,
-      provider: providerName,
-      amount: value,
-      currency,
-      description: String(
-        req.body.description || "Wallet deposit"
-      )
-    });
+    const provider =
+      paymentService.getProvider(
+        providerName
+      );
 
-    const checkout = await provider.createDeposit({
-      paymentId: payment.id,
-      amount: payment.amount,
-      currency: payment.currency,
-      email: req.user.email,
-      name: req.user.full_name,
-      redirectUrl:
-        process.env.PAYMENT_REDIRECT_URL ||
-        "https://vicky-wallet-frontend.onrender.com/payment/callback"
-    });
+    const payment =
+      paymentService.createPaymentIntent({
+        userId: req.user.id,
+        provider: providerName,
+        amount: value,
+        currency,
+        description: String(
+          req.body.description ||
+          "Wallet deposit"
+        )
+      });
 
-    db.prepare(`
-      UPDATE payment_intents
-      SET provider_reference = ?,
-          status = 'pending',
-          updated_at = ?
-      WHERE id = ?
-    `).run(
-      checkout.provider_reference || null,
-      now(),
-      payment.id
+    try {
+      const checkout =
+        await provider.createDeposit({
+          paymentId: payment.id,
+          amount: payment.amount,
+          currency: payment.currency,
+          email: req.user.email,
+          name: req.user.full_name,
+          redirectUrl:
+            process.env.PAYMENT_REDIRECT_URL ||
+            "https://vicky-wallet-frontend.onrender.com/payment/callback"
+        });
+
+      db.prepare(`
+        UPDATE payment_intents
+        SET provider_reference = ?,
+            status = 'processing',
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        checkout.provider_reference || null,
+        now(),
+        payment.id
+      );
+
+      return res.status(201).json({
+        message:
+          "Deposit checkout created",
+        payment_id: payment.id,
+        provider:
+          checkout.provider,
+        provider_reference:
+          checkout.provider_reference,
+        checkout_url:
+          checkout.checkout_url,
+        status: "processing",
+        amount:
+          payment.amount,
+        currency:
+          payment.currency
+      });
+    } catch (providerError) {
+      paymentService.updateStatus(
+        payment.id,
+        "failed"
+      );
+
+      throw providerError;
+    }
+  } catch (error) {
+    console.error(
+      "Deposit initialization error:",
+      error
     );
 
-    res.status(201).json({
-      message: "Deposit checkout created",
-      payment_id: payment.id,
-      provider: checkout.provider,
-      provider_reference: checkout.provider_reference,
-      checkout_url: checkout.checkout_url,
-      status: "pending",
-      amount: payment.amount,
-      currency: payment.currency
-    });
-  } catch (error) {
-    console.error("Deposit initialization error:", error);
-
-    res.status(400).json({
-      error: error.message || "Unable to initialize deposit"
+    return res.status(400).json({
+      error:
+        error.message ||
+        "Unable to initialize deposit"
     });
   }
 });
