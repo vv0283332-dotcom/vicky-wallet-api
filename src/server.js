@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
+import rateLimit from "express-rate-limit";
 
 import { PaymentService } from "./payments/payment-service.js";
 import { WebhookService } from "./payments/webhook-service.js";
@@ -327,7 +328,7 @@ function notifyOwner({
   });
 }
 
-const moveWalletFunds = db.transaction(({
+const moveWalletFunds = ({
   senderId,
   recipientId,
   amount,
@@ -338,79 +339,98 @@ const moveWalletFunds = db.transaction(({
     throw new Error("Invalid transfer amount");
   }
 
-  const sender = db.prepare(`
-    SELECT id, account_id, balance, currency
-    FROM users
-    WHERE id = ?
-  `).get(senderId);
+  db.exec("BEGIN");
 
-  const recipient = db.prepare(`
-    SELECT id, account_id, full_name, balance, currency
-    FROM users
-    WHERE id = ?
-  `).get(recipientId);
+  try {
+    const sender = db.prepare(`
+      SELECT id, account_id, balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(senderId);
 
-  if (!sender) throw new Error("Sender not found");
-  if (!recipient) throw new Error("Recipient not found");
+    const recipient = db.prepare(`
+      SELECT id, account_id, full_name, balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(recipientId);
 
-  if (sender.id === recipient.id) {
-    throw new Error("You cannot transfer to yourself");
+    if (!sender) throw new Error("Sender not found");
+    if (!recipient) throw new Error("Recipient not found");
+
+    if (sender.id === recipient.id) {
+      throw new Error("You cannot transfer to yourself");
+    }
+
+    if (Number(sender.balance) < amount) {
+      throw new Error("Insufficient balance");
+    }
+
+    const createdAt = now();
+    const sentId = id();
+    const receivedId = id();
+
+    const debit = db.prepare(`
+      UPDATE users
+      SET balance = balance - ?
+      WHERE id = ? AND balance >= ?
+    `).run(amount, sender.id, amount);
+
+    if (Number(debit.changes) !== 1) {
+      throw new Error("Transfer could not debit sender balance");
+    }
+
+    const credit = db.prepare(`
+      UPDATE users
+      SET balance = balance + ?
+      WHERE id = ?
+    `).run(amount, recipient.id);
+
+    if (Number(credit.changes) !== 1) {
+      throw new Error("Transfer could not credit recipient balance");
+    }
+
+    db.prepare(`
+      INSERT INTO transactions
+      (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
+      VALUES (?, ?, 'transfer_sent', ?, ?, ?, ?, 'completed', ?)
+    `).run(
+      sentId,
+      sender.id,
+      amount,
+      currency || sender.currency,
+      description,
+      recipient.id,
+      createdAt
+    );
+
+    db.prepare(`
+      INSERT INTO transactions
+      (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
+      VALUES (?, ?, 'transfer_received', ?, ?, ?, ?, 'completed', ?)
+    `).run(
+      receivedId,
+      recipient.id,
+      amount,
+      currency || recipient.currency,
+      description,
+      sender.id,
+      createdAt
+    );
+
+    db.exec("COMMIT");
+
+    return {
+      transaction_id: sentId,
+      received_transaction_id: receivedId
+    };
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+
+    throw error;
   }
-
-  if (Number(sender.balance) < amount) {
-    throw new Error("Insufficient balance");
-  }
-
-  const createdAt = now();
-  const sentId = id();
-  const receivedId = id();
-
-  db.prepare(`
-    UPDATE users
-    SET balance = balance - ?
-    WHERE id = ? AND balance >= ?
-  `).run(amount, sender.id, amount);
-
-  db.prepare(`
-    UPDATE users
-    SET balance = balance + ?
-    WHERE id = ?
-  `).run(amount, recipient.id);
-
-  db.prepare(`
-    INSERT INTO transactions
-    (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
-    VALUES (?, ?, 'transfer_sent', ?, ?, ?, ?, 'completed', ?)
-  `).run(
-    sentId,
-    sender.id,
-    amount,
-    currency || sender.currency,
-    description,
-    recipient.id,
-    createdAt
-  );
-
-  db.prepare(`
-    INSERT INTO transactions
-    (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
-    VALUES (?, ?, 'transfer_received', ?, ?, ?, ?, 'completed', ?)
-  `).run(
-    receivedId,
-    recipient.id,
-    amount,
-    currency || recipient.currency,
-    description,
-    sender.id,
-    createdAt
-  );
-
-  return {
-    transaction_id: sentId,
-    received_transaction_id: receivedId
-  };
-});
-
+};
 
 function email(value) {
   return String(value || "").trim().toLowerCase();
