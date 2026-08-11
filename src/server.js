@@ -104,11 +104,19 @@ const dataDir = new URL("../data/", import.meta.url).pathname;
 await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
 const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
 try {
-  db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
-    ON users(referral_code)
-    WHERE referral_code IS NOT NULL;
-  `);
+  const usersTable = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+  ).get();
+
+  if (usersTable) {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
+      ON users(referral_code)
+      WHERE referral_code IS NOT NULL;
+    `);
+  } else {
+    console.warn("Referral-code index deferred until users table exists.");
+  }
 } catch (error) {
   console.warn("Referral-code index deferred:", error.message);
 }
