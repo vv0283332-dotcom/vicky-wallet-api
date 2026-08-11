@@ -2230,6 +2230,203 @@ app.get("/earnings/history", auth, (req, res) => {
   }
 });
 
+
+// ==================== LINKED FINANCIAL ACCOUNTS ====================
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS linked_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    provider_account_id TEXT NOT NULL,
+    account_name TEXT,
+    masked_account_number TEXT,
+    account_type TEXT,
+    currency TEXT NOT NULL DEFAULT 'NGN',
+    balance REAL NOT NULL DEFAULT 0,
+    balance_updated_at TEXT,
+    status TEXT NOT NULL DEFAULT 'connected',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, provider, provider_account_id),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_linked_accounts_user
+  ON linked_accounts(user_id, updated_at DESC);
+
+  CREATE TABLE IF NOT EXISTS financial_account_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    linked_account_id INTEGER,
+    user_id INTEGER,
+    provider TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_id TEXT,
+    payload TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_financial_events_user
+  ON financial_account_events(user_id, created_at DESC);
+`);
+
+app.get("/linked-accounts", auth, (req, res) => {
+  try {
+    const accounts = db.prepare(`
+      SELECT
+        id,
+        provider,
+        provider_account_id,
+        account_name,
+        masked_account_number,
+        account_type,
+        currency,
+        balance,
+        balance_updated_at,
+        status,
+        created_at,
+        updated_at
+      FROM linked_accounts
+      WHERE user_id = ?
+      ORDER BY updated_at DESC
+    `).all(req.user.id);
+
+    res.json({
+      accounts: accounts.map(account => ({
+        ...account,
+        balance: Number(account.balance || 0)
+      }))
+    });
+  } catch (error) {
+    console.error("Linked accounts error:", error);
+    res.status(500).json({
+      error: "Unable to load linked accounts"
+    });
+  }
+});
+
+app.get("/linked-accounts/summary", auth, (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT currency, COALESCE(SUM(balance), 0) AS total
+      FROM linked_accounts
+      WHERE user_id = ?
+        AND status = 'connected'
+      GROUP BY currency
+    `).all(req.user.id);
+
+    const accounts = rows.map(row => ({
+      currency: row.currency,
+      total: Number(row.total || 0)
+    }));
+
+    res.json({ accounts });
+  } catch (error) {
+    console.error("Linked account summary error:", error);
+    res.status(500).json({
+      error: "Unable to load external balance summary"
+    });
+  }
+});
+
+app.get("/linked-accounts/:id", auth, (req, res) => {
+  try {
+    const account = db.prepare(`
+      SELECT
+        id,
+        provider,
+        provider_account_id,
+        account_name,
+        masked_account_number,
+        account_type,
+        currency,
+        balance,
+        balance_updated_at,
+        status,
+        created_at,
+        updated_at
+      FROM linked_accounts
+      WHERE id = ?
+        AND user_id = ?
+    `).get(Number(req.params.id), req.user.id);
+
+    if (!account) {
+      return res.status(404).json({
+        error: "Linked account not found"
+      });
+    }
+
+    res.json({
+      account: {
+        ...account,
+        balance: Number(account.balance || 0)
+      }
+    });
+  } catch (error) {
+    console.error("Linked account lookup error:", error);
+    res.status(500).json({
+      error: "Unable to load linked account"
+    });
+  }
+});
+
+app.delete("/linked-accounts/:id", auth, (req, res) => {
+  try {
+    const account = db.prepare(`
+      SELECT id
+      FROM linked_accounts
+      WHERE id = ?
+        AND user_id = ?
+    `).get(Number(req.params.id), req.user.id);
+
+    if (!account) {
+      return res.status(404).json({
+        error: "Linked account not found"
+      });
+    }
+
+    db.prepare(`
+      DELETE FROM linked_accounts
+      WHERE id = ?
+        AND user_id = ?
+    `).run(Number(req.params.id), req.user.id);
+
+    res.json({
+      message: "Linked account disconnected"
+    });
+  } catch (error) {
+    console.error("Disconnect linked account error:", error);
+    res.status(500).json({
+      error: "Unable to disconnect account"
+    });
+  }
+});
+
+// Provider callback/event endpoint.
+// Individual providers must be validated before updating balances.
+app.post("/webhooks/financial/:provider", (req, res) => {
+  try {
+    const provider = String(req.params.provider || "").trim().toLowerCase();
+
+    if (!provider) {
+      return res.status(400).json({
+        error: "Provider is required"
+      });
+    }
+
+    console.log(`Financial provider webhook received: ${provider}`);
+
+    res.status(200).json({
+      received: true
+    });
+  } catch (error) {
+    console.error("Financial webhook error:", error);
+    res.status(500).json({
+      error: "Webhook processing failed"
+    });
+  }
+});
+
 // ==================== OWNER / ADMIN API ====================
 
 function adminAuth(req, res, next) {
