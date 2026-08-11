@@ -15,6 +15,14 @@ import { WebhookService } from "./payments/webhook-service.js";
 import { MockProvider } from "./payments/providers/mock-provider.js";
 import { FlutterwaveProvider } from "./payments/providers/flutterwave-provider.js";
 import { createEarningsService } from "./earnings/earnings-service.js";
+
+import {
+  providerStatus,
+  getAdammaAccounts,
+  assertOpayConfigured,
+  createConnectionId
+} from "./providers/financial-provider.js";
+
 const app = express();
 
 /* ================= SECURITY HARDENING ================= */
@@ -2642,6 +2650,97 @@ if (bootstrapEmail && bootstrapPassword.length >= 8) {
     console.log("👑 Owner account bootstrapped");
   }
 }
+
+
+
+// ============================================================
+// FINANCIAL PROVIDER CONNECTIONS
+// ============================================================
+
+// Provider availability.
+// Does not expose API secrets.
+app.get("/financial/providers", auth, (req, res) => {
+  res.json({
+    providers: providerStatus()
+  });
+});
+
+// Create a bank-account connection session.
+// The frontend should redirect the user to the provider's
+// official authorization/consent flow.
+app.post("/financial/bank/connect", auth, (req, res) => {
+  try {
+    const connectionId = createConnectionId();
+
+    res.json({
+      connection_id: connectionId,
+      provider: "adamma",
+      status: "authorization_required",
+      message:
+        "Authorize your bank through the approved banking provider."
+    });
+  } catch (error) {
+    console.error("Bank connection error:", error);
+
+    res.status(500).json({
+      error: "Unable to start bank connection"
+    });
+  }
+});
+
+// Exchange a provider-issued authorization token for
+// account information.
+//
+// The token must come from the provider's official
+// authorization flow. Never send a bank password here.
+app.post("/financial/bank/accounts", auth, async (req, res) => {
+  try {
+    const accessToken = String(
+      req.body?.access_token || ""
+    ).trim();
+
+    if (!accessToken) {
+      return res.status(400).json({
+        error: "Bank authorization token is required"
+      });
+    }
+
+    const data = await getAdammaAccounts(accessToken);
+
+    res.json({
+      provider: "adamma",
+      accounts: data
+    });
+  } catch (error) {
+    console.error("Bank account retrieval error:", error);
+
+    res.status(502).json({
+      error: "Unable to retrieve bank accounts"
+    });
+  }
+});
+
+// OPay Business/Digital Wallet readiness.
+app.get("/financial/opay/status", auth, (req, res) => {
+  try {
+    assertOpayConfigured();
+
+    res.json({
+      provider: "opay",
+      status: "configured",
+      message:
+        "OPay credentials are configured. Use the approved OPay integration."
+    });
+  } catch {
+    res.json({
+      provider: "opay",
+      status: "credentials_required",
+      message:
+        "OPay Business/Digital Wallet credentials are required."
+    });
+  }
+});
+
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Vicky Pay running on port ${PORT}`);
