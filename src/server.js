@@ -2454,3 +2454,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`🗄️ SQLite database: data/vicky-wallet.sqlite`);
   console.log(`🔐 JWT authentication enabled`);
 });
+
+// Production deployment: referral rewards API
