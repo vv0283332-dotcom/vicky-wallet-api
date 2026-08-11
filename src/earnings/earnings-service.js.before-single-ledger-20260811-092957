@@ -1,0 +1,215 @@
+import crypto from "node:crypto";
+
+export function createEarningsService(db) {
+  const id = () => crypto.randomUUID();
+  const now = () => new Date().toISOString();
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS earning_accounts (
+      user_id TEXT PRIMARY KEY,
+      available REAL NOT NULL DEFAULT 0,
+      lifetime_earned REAL NOT NULL DEFAULT 0,
+      lifetime_withdrawn REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS earning_events (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      amount REAL NOT NULL,
+      currency TEXT NOT NULL,
+      source_user_id TEXT,
+      reference_id TEXT,
+      description TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'completed',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(source_user_id) REFERENCES users(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_earning_events_user
+      ON earning_events(user_id, created_at DESC);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_earning_events_reference
+      ON earning_events(type, reference_id)
+      WHERE reference_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS referrals (
+      id TEXT PRIMARY KEY,
+      referrer_user_id TEXT NOT NULL,
+      referred_user_id TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'registered',
+      reward_amount REAL NOT NULL DEFAULT 0,
+      reward_currency TEXT NOT NULL DEFAULT 'USD',
+      rewarded_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(referrer_user_id) REFERENCES users(id),
+      FOREIGN KEY(referred_user_id) REFERENCES users(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_referrals_referrer
+      ON referrals(referrer_user_id, created_at DESC);
+  `);
+
+  function ensureAccount(userId) {
+    const existing = db.prepare(`
+      SELECT *
+      FROM earning_accounts
+      WHERE user_id = ?
+    `).get(userId);
+
+    if (existing) return existing;
+
+    const timestamp = now();
+
+    db.prepare(`
+      INSERT INTO earning_accounts
+      (user_id, available, lifetime_earned, lifetime_withdrawn,
+       created_at, updated_at)
+      VALUES (?, 0, 0, 0, ?, ?)
+    `).run(userId, timestamp, timestamp);
+
+    return db.prepare(`
+      SELECT *
+      FROM earning_accounts
+      WHERE user_id = ?
+    `).get(userId);
+  }
+
+  function credit({
+    userId,
+    type,
+    amount,
+    currency = "USD",
+    description,
+    sourceUserId = null,
+    referenceId = null
+  }) {
+    if (!userId) throw new Error("Missing earning user");
+
+    amount = Number(amount);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error("Invalid earning amount");
+    }
+
+    ensureAccount(userId);
+
+    const existing = referenceId
+      ? db.prepare(`
+          SELECT *
+          FROM earning_events
+          WHERE type = ? AND reference_id = ?
+          LIMIT 1
+        `).get(type, referenceId)
+      : null;
+
+    if (existing) {
+      return {
+        already_credited: true,
+        event: existing
+      };
+    }
+
+    const timestamp = now();
+    const eventId = id();
+
+    db.exec("BEGIN IMMEDIATE");
+
+    try {
+      db.prepare(`
+        INSERT INTO earning_events
+        (
+          id,
+          user_id,
+          type,
+          amount,
+          currency,
+          source_user_id,
+          reference_id,
+          description,
+          status,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)
+      `).run(
+        eventId,
+        userId,
+        type,
+        amount,
+        currency,
+        sourceUserId,
+        referenceId,
+        description,
+        timestamp
+      );
+
+      db.prepare(`
+        UPDATE earning_accounts
+        SET
+          available = available + ?,
+          lifetime_earned = lifetime_earned + ?,
+          updated_at = ?
+        WHERE user_id = ?
+      `).run(
+        amount,
+        amount,
+        timestamp,
+        userId
+      );
+
+      db.exec("COMMIT");
+
+      return {
+        already_credited: false,
+        event: db.prepare(`
+          SELECT *
+          FROM earning_events
+          WHERE id = ?
+        `).get(eventId)
+      };
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+
+      throw error;
+    }
+  }
+
+  function getAccount(userId) {
+    return ensureAccount(userId);
+  }
+
+  function getHistory(userId, limit = 100) {
+    const safeLimit = Math.min(
+      Math.max(Number(limit) || 100, 1),
+      100
+    );
+
+    return db.prepare(`
+      SELECT
+        id,
+        type,
+        amount,
+        currency,
+        description,
+        status,
+        created_at
+      FROM earning_events
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+      LIMIT ${safeLimit}
+    `).all(userId);
+  }
+
+  return {
+    ensureAccount,
+    credit,
+    getAccount,
+    getHistory
+  };
+}
