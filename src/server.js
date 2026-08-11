@@ -233,6 +233,38 @@ function createNotification({
   return notificationId;
 }
 
+function notifyOwner({
+  type = "owner_activity",
+  title,
+  message
+}) {
+  const ownerEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+
+  if (!ownerEmail) {
+    console.warn("ADMIN_EMAIL is not configured; owner notification skipped.");
+    return null;
+  }
+
+  const owner = db.prepare(`
+    SELECT id
+    FROM users
+    WHERE lower(email) = lower(?)
+    LIMIT 1
+  `).get(ownerEmail);
+
+  if (!owner) {
+    console.warn("Owner account not found for ADMIN_EMAIL:", ownerEmail);
+    return null;
+  }
+
+  return createNotification({
+    userId: owner.id,
+    type,
+    title,
+    message
+  });
+}
+
 const moveWalletFunds = db.transaction(({
   senderId,
   recipientId,
@@ -525,6 +557,12 @@ app.post("/auth/register", authLimiter, async (req, res) => {
       message: "Your Vicky Pay account was created successfully."
     });
 
+    notifyOwner({
+      type: "new_user",
+      title: "New User Registration",
+      message: `${user.full_name} (${user.email}) just created a new Vicky Pay account.`
+    });
+
     return res.status(201).json({
       message: "Registration successful",
       token: token(user),
@@ -582,6 +620,12 @@ app.post("/auth/login", authLimiter, async (req, res) => {
       type: "login",
       title: "Login successful",
       message: "You successfully signed in to Vicky Pay."
+    });
+
+    notifyOwner({
+      type: "user_login",
+      title: "User Login",
+      message: `${user.full_name} (${user.email}) successfully logged in to Vicky Pay.`
     });
 
     return res.json({
