@@ -1721,9 +1721,52 @@ app.post("/payments/webhook/flutterwave", async (req, res) => {
   }
 });
 
+
+function getUserLinkedFinancialAccount(userId, accountId) {
+  const id = Number(accountId);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return null;
+  }
+
+  return db.prepare(`
+    SELECT
+      id,
+      user_id,
+      provider,
+      provider_account_id,
+      account_name,
+      masked_account_number,
+      account_type,
+      currency,
+      balance,
+      balance_updated_at,
+      status
+    FROM linked_accounts
+    WHERE id = ?
+      AND user_id = ?
+      AND status = 'connected'
+    LIMIT 1
+  `).get(id, userId);
+}
+
 app.post("/payments/deposit", auth, async (req, res) => {
   try {
     const value = Number(req.body.amount);
+    const sourceAccountId =
+      req.body.source_account_id ??
+      req.body.sourceAccountId ??
+      req.body.account_id ??
+      req.body.accountId;
+
+    const sourceAccount =
+      getUserLinkedFinancialAccount(req.user.id, sourceAccountId);
+
+    if (!sourceAccount) {
+      return res.status(400).json({
+        error: "Select a valid connected account to fund this deposit"
+      });
+    }
 
     if (!paymentService.validateAmount(value)) {
       return res.status(400).json({
@@ -1767,7 +1810,7 @@ app.post("/payments/deposit", auth, async (req, res) => {
         currency,
         description: String(
           req.body.description ||
-          "Wallet deposit"
+          `Wallet deposit from ${sourceAccount.account_name || sourceAccount.masked_account_number || sourceAccount.provider}`
         )
       });
 
@@ -1817,7 +1860,14 @@ app.post("/payments/deposit", auth, async (req, res) => {
         amount:
           payment.amount,
         currency:
-          payment.currency
+          payment.currency,
+        source_account: {
+          id: sourceAccount.id,
+          provider: sourceAccount.provider,
+          account_name: sourceAccount.account_name,
+          account_number: sourceAccount.masked_account_number,
+          currency: sourceAccount.currency
+        }
       });
     } catch (providerError) {
       paymentService.updateStatus(
@@ -1852,6 +1902,24 @@ app.post("/wallet/deposit", auth, (req, res) => {
 app.post("/wallet/withdraw", auth, (req, res) => {
   try {
     const value = Number(req.body.amount);
+
+    const destinationAccountId =
+      req.body.destination_account_id ??
+      req.body.destinationAccountId ??
+      req.body.account_id ??
+      req.body.accountId;
+
+    const destinationAccount =
+      getUserLinkedFinancialAccount(
+        req.user.id,
+        destinationAccountId
+      );
+
+    if (!destinationAccount) {
+      return res.status(400).json({
+        error: "Select a valid connected account to receive this withdrawal"
+      });
+    }
 
     if (!Number.isFinite(value) || value <= 0) {
       return res.status(400).json({
@@ -1894,7 +1962,8 @@ app.post("/wallet/withdraw", auth, (req, res) => {
     }
 
     const description = String(
-      req.body.description || "Wallet withdrawal"
+      req.body.description ||
+      `Wallet withdrawal to ${destinationAccount.account_name || destinationAccount.masked_account_number || destinationAccount.provider}`
     ).trim();
 
     const withdrawal = paymentService.createPaymentIntent({
