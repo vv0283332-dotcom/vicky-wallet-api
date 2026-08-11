@@ -1038,6 +1038,82 @@ app.post("/auth/login", authLimiter, async (req, res) => {
   }
 });
 
+
+app.get("/referrals", auth, (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const user = db.prepare(`
+      SELECT id, full_name, email, referral_code
+      FROM users
+      WHERE id = ?
+    `).get(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const referrals = db.prepare(`
+      SELECT
+        r.id,
+        r.referral_code,
+        r.status,
+        r.reward_amount,
+        r.reward_currency,
+        r.rewarded_at,
+        r.created_at,
+        u.id AS referred_user_id,
+        u.full_name AS referred_name,
+        u.created_at AS referred_created_at
+      FROM referrals r
+      JOIN users u ON u.id = r.referred_id
+      WHERE r.referrer_id = ?
+      ORDER BY r.created_at DESC
+    `).all(userId);
+
+    const totals = db.prepare(`
+      SELECT
+        COUNT(*) AS total,
+        COALESCE(SUM(
+          CASE WHEN status = 'rewarded'
+          THEN reward_amount ELSE 0 END
+        ), 0) AS total_rewards
+      FROM referrals
+      WHERE referrer_id = ?
+    `).get(userId);
+
+    return res.json({
+      referral: {
+        code: user.referral_code || null,
+        total: Number(totals?.total || 0),
+        total_rewards: Number(totals?.total_rewards || 0)
+      },
+      referrals: referrals.map(r => ({
+        id: r.id,
+        code: r.referral_code,
+        status: r.status,
+        reward_amount: Number(r.reward_amount || 0),
+        reward_currency: r.reward_currency,
+        rewarded_at: r.rewarded_at,
+        created_at: r.created_at,
+        referred_user: {
+          id: r.referred_user_id,
+          full_name: r.referred_name,
+          created_at: r.referred_created_at
+        }
+      }))
+    });
+  } catch (error) {
+    console.error("Referral lookup error:", error);
+
+    return res.status(500).json({
+      error: "Unable to load referrals"
+    });
+  }
+});
+
 app.get("/auth/me", auth, (req, res) => {
   res.json({ user: userData(req.user) });
 });
