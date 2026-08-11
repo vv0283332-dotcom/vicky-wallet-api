@@ -93,18 +93,15 @@ const dataDir = new URL("../data/", import.meta.url).pathname;
 await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
 const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
 try {
-  db.exec(`ALTER TABLE users ADD COLUMN referral_code TEXT`);
+  try {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
+    ON users(referral_code)
+    WHERE referral_code IS NOT NULL;
+  `);
 } catch (error) {
-  if (!String(error?.message || "").toLowerCase().includes("duplicate column")) {
-    console.warn("Referral-code migration:", error.message);
-  }
+  console.warn("Referral-code index deferred:", error.message);
 }
-
-db.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
-  ON users(referral_code)
-  WHERE referral_code IS NOT NULL;
-`);
 
 const paymentProviders = {
   mock: new MockProvider(),
