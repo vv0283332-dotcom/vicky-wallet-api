@@ -13,6 +13,7 @@ import { PaymentService } from "./payments/payment-service.js";
 import { WebhookService } from "./payments/webhook-service.js";
 import { MockProvider } from "./payments/providers/mock-provider.js";
 import { FlutterwaveProvider } from "./payments/providers/flutterwave-provider.js";
+import { createEarningsService } from "./earnings/earnings-service.js";
 const app = express();
 
 /* ================= SECURITY HARDENING ================= */
@@ -90,12 +91,27 @@ app.use((req, res, next) => {
 const dataDir = new URL("../data/", import.meta.url).pathname;
 await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
 const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN referral_code TEXT`);
+} catch (error) {
+  if (!String(error?.message || "").toLowerCase().includes("duplicate column")) {
+    console.warn("Referral-code migration:", error.message);
+  }
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
+  ON users(referral_code)
+  WHERE referral_code IS NOT NULL;
+`);
+
 const paymentProviders = {
   mock: new MockProvider(),
   flutterwave: new FlutterwaveProvider()
 };
 
 const paymentService = new PaymentService(db, paymentProviders);
+const earningsService = createEarningsService(db);
 const webhookService = new WebhookService(db);
 
 
@@ -111,6 +127,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   currency TEXT NOT NULL DEFAULT 'USD',
   balance REAL NOT NULL DEFAULT 0,
+  referral_code TEXT UNIQUE,
   created_at TEXT NOT NULL
 );
 
@@ -202,6 +219,51 @@ ON payment_webhooks(payload_hash);
 
 CREATE INDEX IF NOT EXISTS idx_transactions_user
 ON transactions(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS referral_codes (
+  user_id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS referrals (
+  id TEXT PRIMARY KEY,
+  referrer_id TEXT NOT NULL,
+  referred_id TEXT NOT NULL UNIQUE,
+  referral_code TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  qualifying_payment_id TEXT,
+  reward_amount REAL NOT NULL DEFAULT 5,
+  reward_currency TEXT NOT NULL DEFAULT 'USD',
+  rewarded_at TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(referrer_id) REFERENCES users(id),
+  FOREIGN KEY(referred_id) REFERENCES users(id),
+  FOREIGN KEY(qualifying_payment_id) REFERENCES payment_intents(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_referrals_referrer
+ON referrals(referrer_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS earning_transactions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  amount REAL NOT NULL,
+  currency TEXT NOT NULL,
+  description TEXT NOT NULL,
+  referral_id TEXT,
+  transaction_id TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id),
+  FOREIGN KEY(referral_id) REFERENCES referrals(id),
+  FOREIGN KEY(transaction_id) REFERENCES transactions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earning_transactions_user
+ON earning_transactions(user_id, created_at DESC);
+
 `);
 
 const id = () => crypto.randomUUID();
@@ -375,6 +437,7 @@ function userData(user) {
     email: user.email,
     currency: user.currency,
     balance: Number(user.balance),
+    referral_code: user.referral_code || null,
     created_at: user.created_at
   };
 }
@@ -393,7 +456,7 @@ function auth(req, res, next) {
     const payload = jwt.verify(accessToken, JWT_SECRET);
 
     const user = db.prepare(`
-      SELECT id, account_id, full_name, email, currency, balance, created_at
+      SELECT id, account_id, full_name, email, currency, balance, referral_code, created_at
       FROM users WHERE id = ?
     `).get(payload.sub);
 
@@ -424,6 +487,273 @@ app.get("/health", (req, res) => {
     time: now()
   });
 });
+
+
+function generateReferralCode(fullName = "") {
+  const clean = String(fullName)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  const prefix = clean.slice(0, 4) || "VICKY";
+
+  let code;
+
+  do {
+    const random = crypto.randomBytes(3).toString("hex").toUpperCase();
+    code = `${prefix}-${random}`;
+  } while (
+    db.prepare("SELECT 1 FROM referral_codes WHERE code = ?").get(code)
+  );
+
+  return code;
+}
+
+function ensureReferralCode(userId, fullName = "") {
+  const existing = db.prepare(`
+    SELECT code
+    FROM referral_codes
+    WHERE user_id = ?
+  `).get(userId);
+
+  if (existing) return existing.code;
+
+  const code = generateReferralCode(fullName);
+
+  db.prepare(`
+    INSERT INTO referral_codes
+    (user_id, code, created_at)
+    VALUES (?, ?, ?)
+  `).run(userId, code, now());
+
+  return code;
+}
+
+function createReferral({
+  referrerId,
+  referredId,
+  referralCode
+}) {
+  if (!referrerId || !referredId || !referralCode) {
+    return null;
+  }
+
+  if (referrerId === referredId) {
+    return null;
+  }
+
+  const existing = db.prepare(`
+    SELECT *
+    FROM referrals
+    WHERE referred_id = ?
+    LIMIT 1
+  `).get(referredId);
+
+  if (existing) return existing;
+
+  const referrer = db.prepare(`
+    SELECT id
+    FROM users
+    WHERE id = ?
+    LIMIT 1
+  `).get(referrerId);
+
+  if (!referrer) return null;
+
+  const referral = {
+    id: id(),
+    referrerId,
+    referredId,
+    referralCode: String(referralCode).trim().toUpperCase()
+  };
+
+  db.prepare(`
+    INSERT INTO referrals
+    (
+      id,
+      referrer_id,
+      referred_id,
+      referral_code,
+      status,
+      reward_amount,
+      reward_currency,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+  `).run(
+    referral.id,
+    referral.referrerId,
+    referral.referredId,
+    referral.referralCode,
+    Number(process.env.REFERRAL_REWARD_AMOUNT || 5),
+    String(process.env.REFERRAL_REWARD_CURRENCY || "USD").toUpperCase(),
+    now()
+  );
+
+  return db.prepare(`
+    SELECT *
+    FROM referrals
+    WHERE id = ?
+  `).get(referral.id);
+}
+
+function rewardReferralForDeposit({
+  referredUserId,
+  paymentIntentId
+}) {
+  const minDeposit = Number(
+    process.env.REFERRAL_MIN_DEPOSIT || 20
+  );
+
+  const rewardAmount = Number(
+    process.env.REFERRAL_REWARD_AMOUNT || 5
+  );
+
+  const rewardCurrency = String(
+    process.env.REFERRAL_REWARD_CURRENCY || "USD"
+  ).toUpperCase();
+
+  const referral = db.prepare(`
+    SELECT *
+    FROM referrals
+    WHERE referred_id = ?
+      AND status = 'pending'
+    LIMIT 1
+  `).get(referredUserId);
+
+  if (!referral) return null;
+
+  if (Number(referral.reward_amount) !== rewardAmount) {
+    return null;
+  }
+
+  if (
+    String(referral.reward_currency).toUpperCase() !==
+    rewardCurrency
+  ) {
+    return null;
+  }
+
+  const payment = db.prepare(`
+    SELECT *
+    FROM payment_intents
+    WHERE id = ?
+      AND status = 'completed'
+    LIMIT 1
+  `).get(paymentIntentId);
+
+  if (!payment) return null;
+
+  if (Number(payment.amount) < minDeposit) {
+    return null;
+  }
+
+  if (
+    String(payment.currency).toUpperCase() !==
+    rewardCurrency
+  ) {
+    return null;
+  }
+
+  const referrer = db.prepare(`
+    SELECT *
+    FROM users
+    WHERE id = ?
+    LIMIT 1
+  `).get(referral.referrer_id);
+
+  if (!referrer) return null;
+
+  const referred = db.prepare(`
+    SELECT *
+    FROM users
+    WHERE id = ?
+    LIMIT 1
+  `).get(referredUserId);
+
+  if (!referred) return null;
+
+  if (referrer.id === referred.id) return null;
+
+  const existingReward = db.prepare(`
+    SELECT *
+    FROM earning_transactions
+    WHERE referral_id = ?
+      AND type = 'referral_reward'
+    LIMIT 1
+  `).get(referral.id);
+
+  if (existingReward) {
+    db.prepare(`
+      UPDATE referrals
+      SET status = 'rewarded',
+          qualifying_payment_id = COALESCE(qualifying_payment_id, ?),
+          rewarded_at = COALESCE(rewarded_at, ?)
+      WHERE id = ?
+        AND status = 'pending'
+    `).run(
+      paymentIntentId,
+      existingReward.created_at || now(),
+      referral.id
+    );
+
+    return {
+      already_rewarded: true,
+      referral,
+      earning: existingReward
+    };
+  }
+
+  const earningId = id();
+  const createdAt = now();
+
+  db.prepare(`
+    INSERT INTO earning_transactions
+    (
+      id,
+      user_id,
+      type,
+      amount,
+      currency,
+      description,
+      referral_id,
+      transaction_id,
+      created_at
+    )
+    VALUES (?, ?, 'referral_reward', ?, ?, ?, ?, NULL, ?)
+  `).run(
+    earningId,
+    referrer.id,
+    rewardAmount,
+    rewardCurrency,
+    `Earned ${rewardCurrency} ${rewardAmount} referral reward from ${referred.full_name}`,
+    referral.id,
+    createdAt
+  );
+
+  db.prepare(`
+    UPDATE referrals
+    SET
+      status = 'rewarded',
+      qualifying_payment_id = ?,
+      rewarded_at = ?
+    WHERE id = ?
+      AND status = 'pending'
+  `).run(
+    paymentIntentId,
+    createdAt,
+    referral.id
+  );
+
+  return {
+    already_rewarded: false,
+    referral_id: referral.id,
+    earning_id: earningId,
+    referrer_user_id: referrer.id,
+    referred_user_id: referred.id,
+    amount: rewardAmount,
+    currency: rewardCurrency
+  };
+}
 
 
 function generateAccountId() {
@@ -459,6 +789,12 @@ app.post("/auth/register", authLimiter, async (req, res) => {
       req.body.preferredCurrency ||
       req.body.currency ||
       "USD"
+    ).trim().toUpperCase();
+
+    const referralCode = String(
+      req.body.referral_code ||
+      req.body.referralCode ||
+      ""
     ).trim().toUpperCase();
 
     if (!fullName) {
@@ -500,6 +836,29 @@ app.post("/auth/register", authLimiter, async (req, res) => {
     const accountId = generateAccountId();
     const createdAt = now();
 
+    let referrer = null;
+
+    if (referralCode) {
+      referrer = db.prepare(`
+        SELECT user_id, code
+        FROM referral_codes
+        WHERE upper(code) = ?
+        LIMIT 1
+      `).get(referralCode);
+
+      if (!referrer) {
+        return res.status(400).json({
+          error: "Invalid referral code"
+        });
+      }
+
+      if (referrer.user_id === userId) {
+        return res.status(400).json({
+          error: "You cannot use your own referral code"
+        });
+      }
+    }
+
     try {
       db.prepare(`
         INSERT INTO users
@@ -537,6 +896,22 @@ app.post("/auth/register", authLimiter, async (req, res) => {
       throw insertError;
     }
 
+    const ownReferralCode = ensureReferralCode(userId, fullName);
+
+    db.prepare(`
+      UPDATE users
+      SET referral_code = ?
+      WHERE id = ?
+    `).run(ownReferralCode, userId);
+
+    if (referrer) {
+      createReferral({
+        referrerId: referrer.user_id,
+        referredId: userId,
+        referralCode: referrer.code
+      });
+    }
+
     const user = db.prepare(`
       SELECT
         id,
@@ -545,6 +920,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
         email,
         currency,
         balance,
+        referral_code,
         created_at
       FROM users
       WHERE id = ?
@@ -1062,6 +1438,18 @@ async function settleFlutterwaveDeposit({
       currentPayment.id
     );
 
+    let referralReward = null;
+
+    try {
+      referralReward = rewardReferralForDeposit({
+        referredUserId: user.id,
+        paymentIntentId: currentPayment.id
+      });
+    } catch (referralError) {
+      console.error("Referral reward error:", referralError);
+      throw referralError;
+    }
+
     db.exec("COMMIT");
 
     createNotification({
@@ -1070,6 +1458,15 @@ async function settleFlutterwaveDeposit({
       title: "Deposit completed",
       message: `Your ${expectedAmount} ${expectedCurrency} deposit has been credited to your wallet.`
     });
+
+    if (referralReward && !referralReward.already_rewarded) {
+      createNotification({
+        userId: referralReward.referrer_user_id,
+        type: "referral_reward",
+        title: "Referral reward earned",
+        message: `You earned ${referralReward.amount} ${referralReward.currency} from a successful referral.`
+      });
+    }
 
     return {
       already_completed: false,
@@ -1691,6 +2088,54 @@ app.get("/wallet/transactions", auth, (req, res) => {
 });
 
 
+
+
+// ==================== USER EARNINGS API ====================
+
+app.get("/earnings", auth, (req, res) => {
+  try {
+    const account = earningsService.getAccount(req.user.id);
+
+    const history = earningsService.getHistory(req.user.id);
+
+    res.json({
+      earnings: {
+        available: Number(account.available),
+        lifetime_earned: Number(account.lifetime_earned),
+        lifetime_withdrawn: Number(account.lifetime_withdrawn)
+      },
+      history: history.map(item => ({
+        ...item,
+        amount: Number(item.amount)
+      }))
+    });
+  } catch (error) {
+    console.error("Earnings error:", error);
+
+    res.status(500).json({
+      error: "Unable to load earnings"
+    });
+  }
+});
+
+app.get("/earnings/history", auth, (req, res) => {
+  try {
+    const history = earningsService.getHistory(req.user.id);
+
+    res.json({
+      transactions: history.map(item => ({
+        ...item,
+        amount: Number(item.amount)
+      }))
+    });
+  } catch (error) {
+    console.error("Earnings history error:", error);
+
+    res.status(500).json({
+      error: "Unable to load earning history"
+    });
+  }
+});
 
 // ==================== OWNER / ADMIN API ====================
 
