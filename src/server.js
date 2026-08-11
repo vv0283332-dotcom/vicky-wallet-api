@@ -18,9 +18,12 @@ import { createEarningsService } from "./earnings/earnings-service.js";
 
 import {
   providerStatus,
-  getAdammaAccounts,
-  assertOpayConfigured,
-  createConnectionId
+  monoConfigured,
+  createMonoSession,
+  exchangeMonoCode,
+  getMonoAccount,
+  opayConfigured,
+  getOpayWalletBalance
 } from "./providers/financial-provider.js";
 
 const app = express();
@@ -101,7 +104,6 @@ const dataDir = new URL("../data/", import.meta.url).pathname;
 await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
 const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
 try {
-  try {
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
     ON users(referral_code)
@@ -2658,89 +2660,173 @@ if (bootstrapEmail && bootstrapPassword.length >= 8) {
 // ============================================================
 
 // Provider availability.
-// Does not expose API secrets.
+// Never expose provider secrets.
 app.get("/financial/providers", auth, (req, res) => {
-  res.json({
-    providers: providerStatus()
-  });
-});
-
-// Create a bank-account connection session.
-// The frontend should redirect the user to the provider's
-// official authorization/consent flow.
-app.post("/financial/bank/connect", auth, (req, res) => {
   try {
-    const connectionId = createConnectionId();
-
     res.json({
-      connection_id: connectionId,
-      provider: "adamma",
-      status: "authorization_required",
-      message:
-        "Authorize your bank through the approved banking provider."
+      providers: providerStatus(),
+      mono: monoConfigured(),
+      opay: opayConfigured()
     });
   } catch (error) {
-    console.error("Bank connection error:", error);
-
+    console.error("Provider status error:", error);
     res.status(500).json({
-      error: "Unable to start bank connection"
+      error: "Unable to load provider status"
     });
   }
 });
 
-// Exchange a provider-issued authorization token for
-// account information.
-//
-// The token must come from the provider's official
-// authorization flow. Never send a bank password here.
-app.post("/financial/bank/accounts", auth, async (req, res) => {
+// Start official Mono bank authorization.
+// Vicky Pay never receives or stores the user's bank password.
+app.post("/financial/bank/connect", auth, async (req, res) => {
   try {
-    const accessToken = String(
-      req.body?.access_token || ""
+    const institution = String(
+      req.body?.institution || ""
     ).trim();
 
-    if (!accessToken) {
+    const name = String(
+      req.user.full_name || ""
+    ).trim();
+
+    const customerEmail = String(
+      req.user.email || ""
+    ).trim().toLowerCase();
+
+    const authMethod = String(
+      req.body?.auth_method || "internet_banking"
+    ).trim();
+
+    if (!institution) {
       return res.status(400).json({
-        error: "Bank authorization token is required"
+        error: "Bank institution is required"
       });
     }
 
-    const data = await getAdammaAccounts(accessToken);
+    if (!monoConfigured()) {
+      return res.status(503).json({
+        error: "Mono bank integration is not configured"
+      });
+    }
 
-    res.json({
-      provider: "adamma",
-      accounts: data
+    const session = await createMonoSession({
+      institution,
+      name,
+      email: customerEmail,
+      authMethod
+    });
+
+    return res.json({
+      provider: "mono",
+      status: "authorization_required",
+      session
     });
   } catch (error) {
-    console.error("Bank account retrieval error:", error);
+    console.error("Mono connection error:", error);
 
-    res.status(502).json({
-      error: "Unable to retrieve bank accounts"
+    return res.status(502).json({
+      error: error.message || "Unable to start bank connection"
     });
   }
 });
 
-// OPay Business/Digital Wallet readiness.
-app.get("/financial/opay/status", auth, (req, res) => {
+// Exchange the code returned by Mono's official authorization
+// flow, then retrieve the connected account information.
+app.post("/financial/bank/accounts", auth, async (req, res) => {
   try {
-    assertOpayConfigured();
+    const code = String(
+      req.body?.code || ""
+    ).trim();
 
-    res.json({
-      provider: "opay",
-      status: "configured",
-      message:
-        "OPay credentials are configured. Use the approved OPay integration."
+    if (!code) {
+      return res.status(400).json({
+        error: "Mono authorization code is required"
+      });
+    }
+
+    if (!monoConfigured()) {
+      return res.status(503).json({
+        error: "Mono bank integration is not configured"
+      });
+    }
+
+    const authorization = await exchangeMonoCode(code);
+
+    const accountId =
+      authorization?.id ||
+      authorization?.data?.id ||
+      authorization?.account_id ||
+      authorization?.data?.account_id;
+
+    if (!accountId) {
+      return res.status(502).json({
+        error: "Mono did not return a permanent account ID"
+      });
+    }
+
+    const account = await getMonoAccount(accountId);
+
+    return res.json({
+      provider: "mono",
+      account_id: accountId,
+      account
     });
-  } catch {
-    res.json({
-      provider: "opay",
-      status: "credentials_required",
-      message:
-        "OPay Business/Digital Wallet credentials are required."
+  } catch (error) {
+    console.error("Mono account retrieval error:", error);
+
+    return res.status(502).json({
+      error: error.message || "Unable to retrieve bank account"
     });
   }
 });
 
+// OPay wallet balance.
+// This requires an eligible OPay Business/Digital Wallet
+// integration and its official credentials.
+app.post("/financial/opay/balance", auth, async (req, res) => {
+  try {
+    const depositCode = String(
+      req.body?.deposit_code ||
+      req.body?.depositCode ||
+      ""
+    ).trim();
+
+    if (!depositCode) {
+      return res.status(400).json({
+        error: "OPay deposit code is required"
+      });
+    }
+
+    if (!opayConfigured()) {
+      return res.status(503).json({
+        error: "OPay integration is not configured"
+      });
+    }
+
+    const wallet = await getOpayWalletBalance(depositCode);
+
+    return res.json({
+      provider: "opay",
+      wallet
+    });
+  } catch (error) {
+    console.error("OPay balance error:", error);
+
+    return res.status(502).json({
+      error: error.message || "Unable to retrieve OPay wallet balance"
+    });
+  }
+});
+
+// OPay integration status.
+app.get("/financial/opay/status", auth, (req, res) => {
+  return res.json({
+    provider: "opay",
+    configured: opayConfigured(),
+    status: opayConfigured()
+      ? "configured"
+      : "credentials_required"
+  });
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Vicky Pay running on port ${PORT}`);
