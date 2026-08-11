@@ -1,72 +1,141 @@
-import crypto from "node:crypto";
+const MONO_BASE = "https://api.withmono.com";
+const OPAY_BASE = "https://payapi.opayweb.com";
 
-function required(name) {
+function requireEnv(name) {
   const value = process.env[name];
-
-  if (!value) {
-    throw new Error(`${name} is not configured`);
-  }
-
+  if (!value) throw new Error(`${name} is not configured`);
   return value;
 }
 
+async function jsonRequest(url, options = {}) {
+  const response = await fetch(url, options);
+
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {}
+
+  if (!response.ok) {
+    const message =
+      body?.message ||
+      body?.error ||
+      `Provider returned HTTP ${response.status}`;
+
+    throw new Error(message);
+  }
+
+  return body;
+}
+
 /*
- * Generic provider interface.
+ * MONO
  *
- * Real bank connections must use the provider's
- * authorization/consent flow. Never collect a user's
- * banking password inside Vicky Pay.
+ * Flow:
+ * 1. Create Connect session
+ * 2. User completes authorization
+ * 3. Exchange returned code for permanent account ID
+ * 4. Retrieve account details/balance
  */
+
+export function monoConfigured() {
+  return Boolean(process.env.MONO_SECRET_KEY);
+}
+
+export async function createMonoSession({
+  institution,
+  name,
+  email,
+  authMethod = "internet_banking"
+}) {
+  const secret = requireEnv("MONO_SECRET_KEY");
+
+  return jsonRequest(`${MONO_BASE}/v2/connect/session`, {
+    method: "POST",
+    headers: {
+      "mono-sec-key": secret,
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify({
+      institution,
+      auth_method: authMethod,
+      scope: "financial_data",
+      customer: {
+        name,
+        email
+      }
+    })
+  });
+}
+
+export async function exchangeMonoCode(code) {
+  const secret = requireEnv("MONO_SECRET_KEY");
+
+  return jsonRequest(`${MONO_BASE}/v2/accounts/auth`, {
+    method: "POST",
+    headers: {
+      "mono-sec-key": secret,
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify({ code })
+  });
+}
+
+export async function getMonoAccount(accountId) {
+  const secret = requireEnv("MONO_SECRET_KEY");
+
+  return jsonRequest(`${MONO_BASE}/v2/accounts/${encodeURIComponent(accountId)}`, {
+    method: "GET",
+    headers: {
+      "mono-sec-key": secret,
+      Accept: "application/json"
+    }
+  });
+}
+
+/*
+ * OPay Digital Wallet
+ *
+ * This is for an OPay business/digital-wallet integration
+ * using official OPay credentials.
+ */
+
+export function opayConfigured() {
+  return Boolean(
+    process.env.OPAY_CLIENT_AUTH_KEY &&
+    process.env.OPAY_MERCHANT_ID
+  );
+}
+
+export async function getOpayWalletBalance(depositCode) {
+  const clientAuthKey = requireEnv("OPAY_CLIENT_AUTH_KEY");
+  const merchantId = requireEnv("OPAY_MERCHANT_ID");
+
+  if (!depositCode) {
+    throw new Error("OPay deposit code is required");
+  }
+
+  return jsonRequest(
+    `${OPAY_BASE}/api/v2/third/depositcode/queryWalletBalance`,
+    {
+      method: "POST",
+      headers: {
+        clientAuthKey,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({
+        opayMerchantId: merchantId,
+        depositCode: String(depositCode)
+      })
+    }
+  );
+}
 
 export function providerStatus() {
   return {
-    adamma: Boolean(process.env.ADAMMA_API_KEY),
-    opay: Boolean(
-      process.env.OPAY_CLIENT_AUTH_KEY &&
-      process.env.OPAY_MERCHANT_ID
-    )
+    mono: monoConfigured(),
+    opay: opayConfigured()
   };
-}
-
-export async function getAdammaAccounts(accessToken) {
-  if (!accessToken) {
-    throw new Error("Bank authorization is required");
-  }
-
-  const response = await fetch(
-    "https://api.adamma.com/v1/accounts",
-    {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Adamma-Version": "2026-05-01",
-        Accept: "application/json"
-      }
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Bank provider returned HTTP ${response.status}`
-    );
-  }
-
-  return response.json();
-}
-
-/*
- * OPay Business/Digital Wallet integration.
- *
- * OPay requires its own authentication/encryption/signing
- * scheme and credentials. This function intentionally refuses
- * to guess those credentials or pretend to access a personal
- * OPay account.
- */
-export function assertOpayConfigured() {
-  required("OPAY_CLIENT_AUTH_KEY");
-  required("OPAY_MERCHANT_ID");
-}
-
-export function createConnectionId() {
-  return crypto.randomUUID();
 }
