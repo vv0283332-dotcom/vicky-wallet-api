@@ -1250,69 +1250,6 @@ app.get("/wallet/balance", auth, (req, res) => {
 // Provider-backed payment intents.
 // Wallet balances are changed only after verified provider settlement.
 
-app.post("/payments/test-intent", auth, async (req, res) => {
-  try {
-    const value = Number(req.body.amount);
-
-    if (!amount(value)) {
-      return res.status(400).json({
-        error: "Invalid payment amount"
-      });
-    }
-
-    const currency = String(
-      req.body.currency || req.user.currency || "USD"
-    ).trim().toUpperCase();
-
-    if (!/^[A-Z]{3}$/.test(currency)) {
-      return res.status(400).json({
-        error: "Invalid currency"
-      });
-    }
-
-    const payment = paymentService.createPaymentIntent({
-      userId: req.user.id,
-      provider: "mock",
-      amount: value,
-      currency,
-      type: "deposit",
-      description: String(
-        req.body.description || "Payment engine test"
-      )
-    });
-
-    const provider = paymentService.getProvider("mock");
-
-    const checkout = await provider.createDeposit({
-      paymentId: payment.id,
-      amount: payment.amount,
-      currency: payment.currency
-    });
-
-    paymentService.setProviderReference(
-      payment.id,
-      checkout.provider_reference
-    );
-
-    const updated = paymentService.getPaymentIntent(payment.id);
-
-    res.status(201).json({
-      message: "Payment engine test created",
-      payment_id: updated.id,
-      provider: checkout.provider,
-      provider_reference: checkout.provider_reference,
-      status: updated.status,
-      amount: updated.amount,
-      currency: updated.currency
-    });
-  } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      error: "Payment engine test failed"
-    });
-  }
-});
 
 async function settleFlutterwaveDeposit({
   transactionId,
@@ -1892,114 +1829,31 @@ app.post("/payments/deposit", auth, async (req, res) => {
 });
 
 app.post("/wallet/deposit", auth, (req, res) => {
-  res.status(501).json({
-    error: "Real-money deposits are not enabled yet",
-    message:
-      "A verified payment provider must be configured before wallet balances can be funded."
+  return res.status(410).json({
+    error: "This deposit endpoint has been retired",
+    use: "/payments/deposit"
   });
 });
 
-app.post("/wallet/withdraw", auth, (req, res) => {
-  try {
-    const value = Number(req.body.amount);
-
-    const destinationAccountId =
-      req.body.destination_account_id ??
-      req.body.destinationAccountId ??
-      req.body.account_id ??
-      req.body.accountId;
-
-    const destinationAccount =
-      getUserLinkedFinancialAccount(
-        req.user.id,
-        destinationAccountId
-      );
-
-    if (!destinationAccount) {
-      return res.status(400).json({
-        error: "Select a valid connected account to receive this withdrawal"
-      });
-    }
-
-    if (!Number.isFinite(value) || value <= 0) {
-      return res.status(400).json({
-        error: "Enter a valid withdrawal amount"
-      });
-    }
-
-    if (value > 100000000) {
-      return res.status(400).json({
-        error: "Withdrawal amount is too large"
-      });
-    }
-
-    const user = db.prepare(`
-      SELECT id, full_name, email, balance, currency
-      FROM users
-      WHERE id = ?
-    `).get(req.user.id);
-
-    if (!user) {
-      return res.status(401).json({
-        error: "User account not found"
-      });
-    }
-
-    if (Number(user.balance) < value) {
-      return res.status(400).json({
-        error: "Insufficient balance"
-      });
-    }
-
-    const currency = String(
-      req.body.currency || user.currency || "USD"
-    ).trim().toUpperCase();
-
-    if (!/^[A-Z]{3}$/.test(currency)) {
-      return res.status(400).json({
-        error: "Invalid currency"
-      });
-    }
-
-    const description = String(
-      req.body.description ||
-      `Wallet withdrawal to ${destinationAccount.account_name || destinationAccount.masked_account_number || destinationAccount.provider}`
-    ).trim();
-
-    const withdrawal = paymentService.createPaymentIntent({
-      userId: user.id,
-      provider: String(
-        req.body.provider || "flutterwave"
-      ).trim().toLowerCase(),
-      amount: value,
-      currency,
-      type: "withdrawal",
-      description: description || "Wallet withdrawal"
-    });
-
-    createNotification({
-      userId: user.id,
-      type: "withdrawal",
-      title: "Withdrawal request",
-      message: `Your withdrawal request for ${value} ${currency} was received.`
-    });
-
-    res.status(201).json({
-      message: "Withdrawal request created",
-      payment_id: withdrawal.id,
-      amount: value,
-      currency,
-      status: "pending",
-      balance: Number(user.balance),
-      description: description || "Wallet withdrawal"
-    });
-  } catch (error) {
-    console.error("Withdrawal initialization error:", error);
-
-    return res.status(400).json({
-      error: error.message || "Unable to create withdrawal"
-    });
-  }
+app.post("/wallet/withdraw", auth, async (req, res) => {
+  /*
+   * Production safety:
+   *
+   * A withdrawal must never reduce the wallet balance until an
+   * actual payout provider has accepted the payout and the
+   * application has a durable settlement/reconciliation path.
+   *
+   * The previous implementation created a pending payment intent
+   * without reserving/debiting funds or executing a payout. That
+   * could allow repeated withdrawal requests against the same
+   * balance.
+   *
+   * Until the payout provider is implemented end-to-end, fail closed.
+   */
+  return res.status(503).json({
+    error: "Withdrawals are temporarily unavailable",
+    message: "Payout processing is not enabled yet. Your wallet balance has not been changed."
+  });
 });
 
 
