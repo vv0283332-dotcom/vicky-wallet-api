@@ -1690,20 +1690,6 @@ function getUserLinkedFinancialAccount(userId, accountId) {
 app.post("/payments/deposit", auth, async (req, res) => {
   try {
     const value = Number(req.body.amount);
-    const sourceAccountId =
-      req.body.source_account_id ??
-      req.body.sourceAccountId ??
-      req.body.account_id ??
-      req.body.accountId;
-
-    const sourceAccount =
-      getUserLinkedFinancialAccount(req.user.id, sourceAccountId);
-
-    if (!sourceAccount) {
-      return res.status(400).json({
-        error: "Select a valid connected account to fund this deposit"
-      });
-    }
 
     if (!paymentService.validateAmount(value)) {
       return res.status(400).json({
@@ -1724,8 +1710,7 @@ app.post("/payments/deposit", auth, async (req, res) => {
     }
 
     const providerName = String(
-      req.body.provider ||
-      "flutterwave"
+      req.body.provider || "flutterwave"
     ).trim().toLowerCase();
 
     if (providerName !== "flutterwave") {
@@ -1734,35 +1719,63 @@ app.post("/payments/deposit", auth, async (req, res) => {
       });
     }
 
-    const provider =
-      paymentService.getProvider(
-        providerName
-      );
+    /*
+     * A connected account is optional for Flutterwave checkout.
+     * If the caller supplies one, validate it and attach it to
+     * the payment description/response. Card checkout does not
+     * require a linked account.
+     */
+    const sourceAccountId =
+      req.body.source_account_id ??
+      req.body.sourceAccountId ??
+      req.body.account_id ??
+      req.body.accountId;
 
-    const payment =
-      paymentService.createPaymentIntent({
-        userId: req.user.id,
-        provider: providerName,
-        amount: value,
-        currency,
-        description: String(
-          req.body.description ||
-          `Wallet deposit from ${sourceAccount.account_name || sourceAccount.masked_account_number || sourceAccount.provider}`
+    const sourceAccount = sourceAccountId
+      ? getUserLinkedFinancialAccount(
+          req.user.id,
+          sourceAccountId
         )
+      : null;
+
+    if (sourceAccountId && !sourceAccount) {
+      return res.status(400).json({
+        error: "The selected funding account is not connected to your account"
       });
+    }
+
+    const sourceDescription = sourceAccount
+      ? `Wallet deposit from ${
+          sourceAccount.account_name ||
+          sourceAccount.masked_account_number ||
+          sourceAccount.provider ||
+          "connected account"
+        }`
+      : "Wallet deposit via Flutterwave";
+
+    const provider = paymentService.getProvider(providerName);
+
+    const payment = paymentService.createPaymentIntent({
+      userId: req.user.id,
+      provider: providerName,
+      amount: value,
+      currency,
+      description: String(
+        req.body.description || sourceDescription
+      )
+    });
 
     try {
-      const checkout =
-        await provider.createDeposit({
-          paymentId: payment.id,
-          amount: payment.amount,
-          currency: payment.currency,
-          email: req.user.email,
-          name: req.user.full_name,
-          redirectUrl:
-            process.env.PAYMENT_REDIRECT_URL ||
-            "https://vicky-wallet-frontend.onrender.com/payment/callback"
-        });
+      const checkout = await provider.createDeposit({
+        paymentId: payment.id,
+        amount: payment.amount,
+        currency: payment.currency,
+        email: req.user.email,
+        name: req.user.full_name,
+        redirectUrl:
+          process.env.PAYMENT_REDIRECT_URL ||
+          "https://vicky-wallet-frontend.onrender.com/payment/callback"
+      });
 
       db.prepare(`
         UPDATE payment_intents
@@ -1780,31 +1793,29 @@ app.post("/payments/deposit", auth, async (req, res) => {
         userId: req.user.id,
         type: "deposit",
         title: "Deposit started",
-        message: `Your ${payment.amount} ${payment.currency} deposit is being processed.`
+        message:
+          `Your ${payment.amount} ${payment.currency} deposit is being processed.`
       });
 
       return res.status(201).json({
-        message:
-          "Deposit checkout created",
+        message: "Deposit checkout created",
         payment_id: payment.id,
-        provider:
-          checkout.provider,
-        provider_reference:
-          checkout.provider_reference,
-        checkout_url:
-          checkout.checkout_url,
+        provider: checkout.provider,
+        provider_reference: checkout.provider_reference,
+        checkout_url: checkout.checkout_url,
         status: "processing",
-        amount:
-          payment.amount,
-        currency:
-          payment.currency,
-        source_account: {
-          id: sourceAccount.id,
-          provider: sourceAccount.provider,
-          account_name: sourceAccount.account_name,
-          account_number: sourceAccount.masked_account_number,
-          currency: sourceAccount.currency
-        }
+        amount: payment.amount,
+        currency: payment.currency,
+        source_account: sourceAccount
+          ? {
+              id: sourceAccount.id,
+              provider: sourceAccount.provider,
+              account_name: sourceAccount.account_name,
+              account_number:
+                sourceAccount.masked_account_number,
+              currency: sourceAccount.currency
+            }
+          : null
       });
     } catch (providerError) {
       paymentService.updateStatus(
@@ -1827,7 +1838,6 @@ app.post("/payments/deposit", auth, async (req, res) => {
     });
   }
 });
-
 app.post("/wallet/deposit", auth, (req, res) => {
   return res.status(410).json({
     error: "This deposit endpoint has been retired",
