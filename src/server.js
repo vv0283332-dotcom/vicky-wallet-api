@@ -12,7 +12,6 @@ import rateLimit from "express-rate-limit";
 
 import { PaymentService } from "./payments/payment-service.js";
 import { WebhookService } from "./payments/webhook-service.js";
-import { MockProvider } from "./payments/providers/mock-provider.js";
 import { FlutterwaveProvider } from "./payments/providers/flutterwave-provider.js";
 import { createEarningsService } from "./earnings/earnings-service.js";
 
@@ -122,7 +121,6 @@ try {
 }
 
 const paymentProviders = {
-  mock: new MockProvider(),
   flutterwave: new FlutterwaveProvider()
 };
 
@@ -1602,6 +1600,62 @@ app.post("/payments/webhook/flutterwave", async (req, res) => {
       payload.data?.reference ||
       "";
 
+    /*
+     * Real Flutterwave transfer reconciliation.
+     * Withdrawal references use the form:
+     * vicky_wd_<payment-intent-id>
+     */
+    if (
+      txRef.startsWith("vicky_wd_") &&
+      payload.data?.id
+    ) {
+      try {
+        const withdrawalResult =
+          await settleFlutterwaveWithdrawal({
+            transactionId: payload.data.id,
+            txRef,
+            eventStatus:
+              payload.data?.status
+        });
+
+        db.prepare(`
+          UPDATE payment_webhooks
+          SET processed = 1,
+              processed_at = ?
+          WHERE provider = ?
+            AND (
+              provider_event_id = ?
+              OR payload_hash = ?
+            )
+        `).run(
+          now(),
+          "flutterwave",
+          eventId || null,
+          payloadHash
+        );
+
+        return res.status(200).json({
+          received: true,
+          processed: true,
+          withdrawal: true,
+          status:
+            withdrawalResult.status || "processing"
+        });
+      } catch (withdrawalError) {
+        console.error(
+          "Flutterwave withdrawal webhook error:",
+          withdrawalError
+        );
+
+        return res.status(200).json({
+          received: true,
+          processed: false,
+          withdrawal: true,
+          error: withdrawalError.message
+        });
+      }
+    }
+
     if (
       eventType === "charge.completed" ||
       String(payload.data?.status || "").toLowerCase() ===
@@ -1845,27 +1899,830 @@ app.post("/wallet/deposit", auth, (req, res) => {
   });
 });
 
-app.post("/wallet/withdraw", auth, async (req, res) => {
-  /*
-   * Production safety:
-   *
-   * A withdrawal must never reduce the wallet balance until an
-   * actual payout provider has accepted the payout and the
-   * application has a durable settlement/reconciliation path.
-   *
-   * The previous implementation created a pending payment intent
-   * without reserving/debiting funds or executing a payout. That
-   * could allow repeated withdrawal requests against the same
-   * balance.
-   *
-   * Until the payout provider is implemented end-to-end, fail closed.
-   */
-  return res.status(503).json({
-    error: "Withdrawals are temporarily unavailable",
-    message: "Payout processing is not enabled yet. Your wallet balance has not been changed."
+
+async function settleFlutterwaveWithdrawal({
+  transactionId,
+  txRef,
+  eventStatus = null
+}) {
+  const provider = paymentService.getProvider("flutterwave");
+
+  const payment = db.prepare(`
+    SELECT *
+    FROM payment_intents
+    WHERE provider = 'flutterwave'
+      AND type = 'withdrawal'
+      AND provider_reference = ?
+    LIMIT 1
+  `).get(String(txRef || "").trim());
+
+  if (!payment) {
+    throw new Error("Withdrawal payment intent not found");
+  }
+
+  if (payment.status === "completed") {
+    return {
+      already_completed: true,
+      status: "completed",
+      payment
+    };
+  }
+
+  if (payment.status === "failed" || payment.status === "cancelled") {
+    return {
+      already_finalized: true,
+      status: payment.status,
+      payment
+    };
+  }
+
+  if (!transactionId) {
+    throw new Error("Flutterwave transfer ID is missing");
+  }
+
+  const verification = await provider.verifyWithdrawal({
+    transferId: transactionId
   });
+
+  const verifiedAmount = Number(verification.amount || 0);
+  const expectedAmount = Number(payment.amount || 0);
+
+  const verifiedCurrency = String(
+    verification.currency || ""
+  ).toUpperCase();
+
+  const expectedCurrency = String(
+    payment.currency || ""
+  ).toUpperCase();
+
+  if (
+    verifiedAmount > 0 &&
+    Math.abs(verifiedAmount - expectedAmount) > 0.000001
+  ) {
+    throw new Error(
+      "Verified withdrawal amount does not match payment intent"
+    );
+  }
+
+  if (
+    verifiedCurrency &&
+    verifiedCurrency !== expectedCurrency
+  ) {
+    throw new Error(
+      "Verified withdrawal currency does not match payment intent"
+    );
+  }
+
+  const status = String(
+    verification.status || eventStatus || "unknown"
+  ).toLowerCase();
+
+  const successful = status === "successful";
+  const failed = ["failed", "cancelled"].includes(status);
+
+  if (!successful && !failed) {
+    return {
+      already_completed: false,
+      status: "processing",
+      payment
+    };
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+
+  try {
+    const currentPayment = db.prepare(`
+      SELECT *
+      FROM payment_intents
+      WHERE id = ?
+    `).get(payment.id);
+
+    if (!currentPayment) {
+      throw new Error("Withdrawal payment intent disappeared");
+    }
+
+    if (
+      currentPayment.status === "completed" ||
+      currentPayment.status === "failed" ||
+      currentPayment.status === "cancelled"
+    ) {
+      db.exec("COMMIT");
+
+      return {
+        already_finalized: true,
+        status: currentPayment.status,
+        payment: currentPayment
+      };
+    }
+
+    const user = db.prepare(`
+      SELECT id, balance, currency
+      FROM users
+      WHERE id = ?
+    `).get(currentPayment.user_id);
+
+    if (!user) {
+      throw new Error("Withdrawal owner not found");
+    }
+
+    const withdrawalTransaction = db.prepare(`
+      SELECT *
+      FROM transactions
+      WHERE user_id = ?
+        AND type = 'withdrawal'
+        AND description LIKE ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(
+      user.id,
+      `%${currentPayment.id}%`
+    );
+
+    if (successful) {
+      db.prepare(`
+        UPDATE payment_intents
+        SET status = 'completed',
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        now(),
+        currentPayment.id
+      );
+
+      if (withdrawalTransaction) {
+        db.prepare(`
+          UPDATE transactions
+          SET status = 'completed'
+          WHERE id = ?
+        `).run(withdrawalTransaction.id);
+      }
+
+      db.exec("COMMIT");
+
+      createNotification({
+        userId: user.id,
+        type: "withdrawal_completed",
+        title: "Withdrawal completed",
+        message:
+          `Your ${expectedAmount} ${expectedCurrency} withdrawal has been completed.`
+      });
+
+      return {
+        already_completed: false,
+        status: "completed",
+        payment: db.prepare(`
+          SELECT *
+          FROM payment_intents
+          WHERE id = ?
+        `).get(currentPayment.id)
+      };
+    }
+
+    /*
+     * Failed/cancelled payout:
+     * release the balance that was reserved when the withdrawal
+     * was created. The refund ledger entry makes the reversal
+     * auditable.
+     */
+    db.prepare(`
+      UPDATE users
+      SET balance = balance + ?
+      WHERE id = ?
+    `).run(
+      expectedAmount,
+      user.id
+    );
+
+    const refundTransactionId = id();
+
+    db.prepare(`
+      INSERT INTO transactions
+      (
+        id,
+        user_id,
+        type,
+        amount,
+        currency,
+        description,
+        related_user_id,
+        status,
+        created_at
+      )
+      VALUES (?, ?, 'withdrawal_refund', ?, ?, ?, NULL, 'completed', ?)
+    `).run(
+      refundTransactionId,
+      user.id,
+      expectedAmount,
+      expectedCurrency,
+      `Refund for failed withdrawal ${currentPayment.id}`,
+      now()
+    );
+
+    db.prepare(`
+      INSERT INTO ledger_entries
+      (
+        id,
+        user_id,
+        payment_intent_id,
+        transaction_id,
+        entry_type,
+        amount,
+        currency,
+        description,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, 'credit', ?, ?, ?, ?)
+    `).run(
+      id(),
+      user.id,
+      currentPayment.id,
+      refundTransactionId,
+      expectedAmount,
+      expectedCurrency,
+      `Withdrawal refund for ${currentPayment.id}`,
+      now()
+    );
+
+    db.prepare(`
+      UPDATE payment_intents
+      SET status = ?,
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      status === "cancelled" ? "cancelled" : "failed",
+      now(),
+      currentPayment.id
+    );
+
+    if (withdrawalTransaction) {
+      db.prepare(`
+        UPDATE transactions
+        SET status = 'failed'
+        WHERE id = ?
+      `).run(withdrawalTransaction.id);
+    }
+
+    db.exec("COMMIT");
+
+    createNotification({
+      userId: user.id,
+      type: "withdrawal_failed",
+      title: "Withdrawal failed",
+      message:
+        `Your ${expectedAmount} ${expectedCurrency} withdrawal failed. The reserved funds have been returned to your wallet.`
+    });
+
+    return {
+      already_completed: false,
+      status: status === "cancelled" ? "cancelled" : "failed",
+      refunded: true,
+      payment: db.prepare(`
+        SELECT *
+        FROM payment_intents
+        WHERE id = ?
+      `).get(currentPayment.id)
+    };
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+}
+
+
+app.post("/wallet/withdraw", auth, async (req, res) => {
+  try {
+    const value = Number(req.body?.amount);
+
+    if (!paymentService.validateAmount(value)) {
+      return res.status(400).json({
+        error: "Invalid withdrawal amount"
+      });
+    }
+
+    const currency = String(
+      req.body?.currency ||
+      req.user.currency ||
+      "USD"
+    ).trim().toUpperCase();
+
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      return res.status(400).json({
+        error: "Invalid currency"
+      });
+    }
+
+    const accountNumber = String(
+      req.body?.account_number ||
+      req.body?.accountNumber ||
+      ""
+    ).trim();
+
+    const bankCode = String(
+      req.body?.bank_code ||
+      req.body?.bankCode ||
+      ""
+    ).trim();
+
+    const beneficiaryName = String(
+      req.body?.beneficiary_name ||
+      req.body?.beneficiaryName ||
+      ""
+    ).trim();
+
+    const narration = String(
+      req.body?.narration ||
+      "Vicky Pay withdrawal"
+    ).trim();
+
+    if (!accountNumber) {
+      return res.status(400).json({
+        error: "Bank account number is required"
+      });
+    }
+
+    if (!bankCode) {
+      return res.status(400).json({
+        error: "Bank code is required"
+      });
+    }
+
+    if (!beneficiaryName) {
+      return res.status(400).json({
+        error: "Beneficiary name is required"
+      });
+    }
+
+    if (currency !== String(req.user.currency || "").toUpperCase()) {
+      return res.status(400).json({
+        error:
+          `Your wallet currency is ${req.user.currency}.`
+      });
+    }
+
+    const user = db.prepare(`
+      SELECT id, account_id, full_name, email, currency, balance
+      FROM users
+      WHERE id = ?
+    `).get(req.user.id);
+
+    if (!user) {
+      return res.status(401).json({
+        error: "User account not found"
+      });
+    }
+
+    /*
+     * Create the payment intent and reserve the wallet balance
+     * atomically before contacting Flutterwave.
+     */
+    const payment = paymentService.createPaymentIntent({
+      userId: user.id,
+      provider: "flutterwave",
+      amount: value,
+      currency,
+      type: "withdrawal",
+      description:
+        `Withdrawal ${value} ${currency}`
+    });
+
+    try {
+      db.exec("BEGIN IMMEDIATE");
+
+      const currentUser = db.prepare(`
+        SELECT id, balance, currency
+        FROM users
+        WHERE id = ?
+      `).get(user.id);
+
+      if (!currentUser) {
+        throw new Error("User account not found");
+      }
+
+      if (Number(currentUser.balance) < value) {
+        throw new Error("Insufficient balance");
+      }
+
+      const debit = db.prepare(`
+        UPDATE users
+        SET balance = balance - ?
+        WHERE id = ?
+          AND balance >= ?
+      `).run(
+        value,
+        user.id,
+        value
+      );
+
+      if (Number(debit.changes) !== 1) {
+        throw new Error("Insufficient balance");
+      }
+
+      const transactionId = id();
+
+      db.prepare(`
+        INSERT INTO transactions
+        (
+          id,
+          user_id,
+          type,
+          amount,
+          currency,
+          description,
+          related_user_id,
+          status,
+          created_at
+        )
+        VALUES (?, ?, 'withdrawal', ?, ?, ?, NULL, 'processing', ?)
+      `).run(
+        transactionId,
+        user.id,
+        value,
+        currency,
+        `Withdrawal ${payment.id}`,
+        now()
+      );
+
+      db.prepare(`
+        INSERT INTO ledger_entries
+        (
+          id,
+          user_id,
+          payment_intent_id,
+          transaction_id,
+          entry_type,
+          amount,
+          currency,
+          description,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, 'debit', ?, ?, ?, ?)
+      `).run(
+        id(),
+        user.id,
+        payment.id,
+        transactionId,
+        value,
+        currency,
+        `Withdrawal reservation ${payment.id}`,
+        now()
+      );
+
+      db.exec("COMMIT");
+    } catch (reservationError) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+
+      paymentService.updateStatus(
+        payment.id,
+        "failed"
+      );
+
+      throw reservationError;
+    }
+
+    try {
+      const provider =
+        paymentService.getProvider("flutterwave");
+
+      const payout =
+        await provider.createWithdrawal({
+          paymentId: payment.id,
+          amount: value,
+          currency,
+          accountNumber,
+          bankCode,
+          beneficiaryName,
+          narration,
+          callbackUrl:
+            process.env.PAYMENT_REDIRECT_URL || ""
+        });
+
+      paymentService.setProviderReference(
+        payment.id,
+        payout.provider_reference
+      );
+
+      const updated =
+        paymentService.getPaymentIntent(payment.id);
+
+      /*
+       * If Flutterwave already returned a terminal successful
+       * status, reconcile immediately. Otherwise leave it
+       * processing and let verification/webhook finalize it.
+       */
+      if (String(payout.status || "").toLowerCase() === "successful") {
+        await settleFlutterwaveWithdrawal({
+          transactionId: payout.transfer_id,
+          txRef: payout.provider_reference,
+          eventStatus: "successful"
+        });
+      }
+
+      const finalPayment =
+        paymentService.getPaymentIntent(payment.id);
+
+      const updatedUser = db.prepare(`
+        SELECT balance, currency
+        FROM users
+        WHERE id = ?
+      `).get(user.id);
+
+      createNotification({
+        userId: user.id,
+        type: "withdrawal_started",
+        title: "Withdrawal submitted",
+        message:
+          `Your ${value} ${currency} withdrawal has been submitted to Flutterwave.`
+      });
+
+      return res.status(201).json({
+        message: "Withdrawal submitted",
+        payment_id: payment.id,
+        provider: "flutterwave",
+        provider_reference:
+          payout.provider_reference,
+        transfer_id:
+          payout.transfer_id,
+        status:
+          finalPayment?.status ||
+          "processing",
+        amount: value,
+        currency,
+        balance:
+          Number(updatedUser.balance),
+        beneficiary: {
+          name: beneficiaryName,
+          account_number:
+            accountNumber.replace(
+              /.(?=.{4})/g,
+              "*"
+            ),
+          bank_code: bankCode
+        }
+      });
+    } catch (providerError) {
+      console.error(
+        "Flutterwave withdrawal error:",
+        providerError
+      );
+
+      /*
+       * The transfer request failed before we obtained a
+       * provider reference. Release the reserved balance.
+       */
+      try {
+        db.exec("BEGIN IMMEDIATE");
+
+        const currentPayment =
+          paymentService.getPaymentIntent(payment.id);
+
+        if (
+          currentPayment &&
+          currentPayment.status !== "completed" &&
+          currentPayment.status !== "failed" &&
+          currentPayment.status !== "cancelled"
+        ) {
+          db.prepare(`
+            UPDATE users
+            SET balance = balance + ?
+            WHERE id = ?
+          `).run(
+            value,
+            user.id
+          );
+
+          const refundTransactionId = id();
+
+          db.prepare(`
+            INSERT INTO transactions
+            (
+              id,
+              user_id,
+              type,
+              amount,
+              currency,
+              description,
+              related_user_id,
+              status,
+              created_at
+            )
+            VALUES (?, ?, 'withdrawal_refund', ?, ?, ?, NULL, 'completed', ?)
+          `).run(
+            refundTransactionId,
+            user.id,
+            value,
+            currency,
+            `Withdrawal initialization refund ${payment.id}`,
+            now()
+          );
+
+          db.prepare(`
+            INSERT INTO ledger_entries
+            (
+              id,
+              user_id,
+              payment_intent_id,
+              transaction_id,
+              entry_type,
+              amount,
+              currency,
+              description,
+              created_at
+            )
+            VALUES (?, ?, ?, ?, 'credit', ?, ?, ?, ?)
+          `).run(
+            id(),
+            user.id,
+            payment.id,
+            refundTransactionId,
+            value,
+            currency,
+            `Refund for failed withdrawal initialization ${payment.id}`,
+            now()
+          );
+
+          db.prepare(`
+            UPDATE payment_intents
+            SET status = 'failed',
+                updated_at = ?
+            WHERE id = ?
+          `).run(
+            now(),
+            payment.id
+          );
+        }
+
+        db.exec("COMMIT");
+      } catch (refundError) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {}
+
+        console.error(
+          "CRITICAL withdrawal refund error:",
+          refundError
+        );
+      }
+
+      return res.status(502).json({
+        error:
+          providerError.message ||
+          "Flutterwave withdrawal could not be created",
+        payment_id: payment.id,
+        status: "failed"
+      });
+    }
+  } catch (error) {
+    console.error(
+      "Wallet withdrawal error:",
+      error
+    );
+
+    const message =
+      error.message ||
+      "Withdrawal failed";
+
+    return res.status(
+      message === "Insufficient balance" ? 400 : 400
+    ).json({
+      error: message
+    });
+  }
 });
 
+
+app.get("/wallet/withdraw/:paymentId", auth, async (req, res) => {
+  try {
+    const payment = db.prepare(`
+      SELECT *
+      FROM payment_intents
+      WHERE id = ?
+        AND user_id = ?
+        AND type = 'withdrawal'
+      LIMIT 1
+    `).get(
+      String(req.params.paymentId),
+      req.user.id
+    );
+
+    if (!payment) {
+      return res.status(404).json({
+        error: "Withdrawal not found"
+      });
+    }
+
+    if (
+      payment.provider === "flutterwave" &&
+      payment.provider_reference &&
+      payment.status === "processing"
+    ) {
+      const provider =
+        paymentService.getProvider("flutterwave");
+
+      /*
+       * Flutterwave transfer IDs are returned when the transfer
+       * is created. Older records may only have the reference.
+       * In that case the webhook remains the authoritative
+       * reconciliation path.
+       */
+      let verified = null;
+
+      const transferId =
+        String(req.query.transfer_id || "").trim();
+
+      if (transferId) {
+        verified =
+          await provider.verifyWithdrawal({
+            transferId
+          });
+
+        if (
+          verified.verified &&
+          (
+            verified.successful ||
+            verified.failed
+          )
+        ) {
+          await settleFlutterwaveWithdrawal({
+            transactionId: transferId,
+            txRef: payment.provider_reference,
+            eventStatus: verified.status
+          });
+        }
+      }
+    }
+
+    const updated =
+      paymentService.getPaymentIntent(payment.id);
+
+    return res.json({
+      payment: updated
+    });
+  } catch (error) {
+    console.error(
+      "Withdrawal status error:",
+      error
+    );
+
+    return res.status(502).json({
+      error:
+        error.message ||
+        "Unable to retrieve withdrawal status"
+    });
+  }
+});
+
+
+
+app.get("/payments/:paymentId", auth, (req, res) => {
+  try {
+    const payment = db.prepare(`
+      SELECT
+        id,
+        provider,
+        provider_reference,
+        amount,
+        currency,
+        type,
+        status,
+        description,
+        created_at,
+        updated_at
+      FROM payment_intents
+      WHERE id = ?
+        AND user_id = ?
+      LIMIT 1
+    `).get(
+      String(req.params.paymentId),
+      req.user.id
+    );
+
+    if (!payment) {
+      return res.status(404).json({
+        error: "Payment not found"
+      });
+    }
+
+    return res.json({
+      payment: {
+        ...payment,
+        amount: Number(payment.amount)
+      }
+    });
+  } catch (error) {
+    console.error(
+      "Payment status error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Unable to load payment status"
+    });
+  }
+});
 
 app.get("/wallet/recipient/:accountId", auth, (req, res) => {
   try {
