@@ -9,6 +9,7 @@ import jwt from "jsonwebtoken";
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
 import rateLimit from "express-rate-limit";
+import multer from "multer";
 
 import { PaymentService } from "./payments/payment-service.js";
 import { WebhookService } from "./payments/webhook-service.js";
@@ -71,6 +72,102 @@ const authLimiter = rateLimit({
 
 app.use(globalLimiter);
 
+
+
+const CLOUDINARY_CLOUD_NAME =
+  String(process.env.CLOUDINARY_CLOUD_NAME || "").trim();
+
+const CLOUDINARY_API_KEY =
+  String(process.env.CLOUDINARY_API_KEY || "").trim();
+
+const CLOUDINARY_API_SECRET =
+  String(process.env.CLOUDINARY_API_SECRET || "").trim();
+
+const cloudinaryConfigured =
+  Boolean(
+    CLOUDINARY_CLOUD_NAME &&
+    CLOUDINARY_API_KEY &&
+    CLOUDINARY_API_SECRET
+  );
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024
+  },
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      "image/jpeg",
+      "image/png",
+      "image/webp"
+    ];
+
+    if (!allowed.includes(file.mimetype)) {
+      return cb(
+        new Error("Only JPG, PNG, and WebP profile photos are allowed")
+      );
+    }
+
+    cb(null, true);
+  }
+});
+
+function cloudinarySignature(timestamp) {
+  const cryptoString =
+    `folder=vicky_pay/avatars&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
+
+  return crypto
+    .createHash("sha1")
+    .update(cryptoString)
+    .digest("hex");
+}
+
+async function uploadAvatarToCloudinary(file) {
+  if (!cloudinaryConfigured) {
+    throw new Error(
+      "Profile photo storage is not configured on the server"
+    );
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const form = new FormData();
+
+  form.append(
+    "file",
+    new Blob([file.buffer], { type: file.mimetype }),
+    file.originalname || "profile-photo"
+  );
+
+  form.append("api_key", CLOUDINARY_API_KEY);
+  form.append("timestamp", String(timestamp));
+  form.append("folder", "vicky_pay/avatars");
+  form.append("signature", cloudinarySignature(timestamp));
+
+  const response = await fetch(
+    `https://api.cloudinary.com/v1_1/${encodeURIComponent(
+      CLOUDINARY_CLOUD_NAME
+    )}/image/upload`,
+    {
+      method: "POST",
+      body: form
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || !data.secure_url) {
+    console.error("Cloudinary upload error:", data);
+    throw new Error(
+      data.error?.message || "Profile photo upload failed"
+    );
+  }
+
+  return {
+    url: data.secure_url,
+    public_id: data.public_id || null
+  };
+}
 
 const PORT = Number(process.env.PORT || 5000);
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -142,6 +239,7 @@ CREATE TABLE IF NOT EXISTS users (
   currency TEXT NOT NULL DEFAULT 'USD',
   balance REAL NOT NULL DEFAULT 0,
   referral_code TEXT UNIQUE,
+  avatar_url TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -279,6 +377,17 @@ CREATE INDEX IF NOT EXISTS idx_earning_transactions_user
 ON earning_transactions(user_id, created_at DESC);
 
 `);
+
+
+try {
+  const userColumns = db.prepare("PRAGMA table_info(users)").all();
+  if (!userColumns.some((column) => column.name === "avatar_url")) {
+    db.exec("ALTER TABLE users ADD COLUMN avatar_url TEXT");
+    console.log("Added users.avatar_url");
+  }
+} catch (error) {
+  console.error("Avatar database migration error:", error);
+}
 
 const id = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
@@ -1131,6 +1240,61 @@ app.get("/auth/me", auth, (req, res) => {
   res.json({ user: userData(req.user) });
 });
 
+
+app.post(
+  "/auth/profile/avatar",
+  auth,
+  avatarUpload.single("avatar"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          error: "Profile photo is required"
+        });
+      }
+
+      const uploaded = await uploadAvatarToCloudinary(req.file);
+
+      db.prepare(`
+        UPDATE users
+        SET avatar_url = ?
+        WHERE id = ?
+      `).run(
+        uploaded.url,
+        req.user.id
+      );
+
+      const user = db.prepare(`
+        SELECT
+          id,
+          account_id,
+          full_name,
+          email,
+          currency,
+          balance,
+          referral_code,
+          avatar_url,
+          created_at
+        FROM users
+        WHERE id = ?
+      `).get(req.user.id);
+
+      res.json({
+        message: "Profile photo updated",
+        user
+      });
+    } catch (error) {
+      console.error("Profile photo upload error:", error);
+
+      res.status(400).json({
+        error:
+          error.message ||
+          "Unable to upload profile photo"
+      });
+    }
+  }
+);
+
 app.patch("/auth/profile", auth, async (req, res) => {
   try {
     const fullName = String(req.body.full_name || "").trim();
@@ -1154,7 +1318,7 @@ app.patch("/auth/profile", auth, async (req, res) => {
     }
 
     const existingEmail = db.prepare(
-      "SELECT id FROM users WHERE email = ? AND id != ?"
+      "SELECT avatar_url, id FROM users WHERE email = ? AND id != ?"
     ).get(newEmail, req.user.id);
 
     if (existingEmail) {
