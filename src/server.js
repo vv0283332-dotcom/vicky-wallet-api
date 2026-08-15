@@ -6,7 +6,7 @@ import morgan from "morgan";
 import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { DatabaseSync } from "node:sqlite";
+import { db } from "./postgres-db.js";
 import crypto from "node:crypto";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
@@ -196,27 +196,6 @@ app.use((req, res, next) => {
   next();
 });
 
-const dataDir = new URL("../data/", import.meta.url).pathname;
-await import("node:fs/promises").then(fs => fs.mkdir(dataDir, { recursive: true }));
-const db = new DatabaseSync(new URL("../data/vicky-wallet.sqlite", import.meta.url).pathname);
-try {
-  const usersTable = db.prepare(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
-  ).get();
-
-  if (usersTable) {
-    db.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
-      ON users(referral_code)
-      WHERE referral_code IS NOT NULL;
-    `);
-  } else {
-    console.warn("Referral-code index deferred until users table exists.");
-  }
-} catch (error) {
-  console.warn("Referral-code index deferred:", error.message);
-}
-
 const paymentProviders = {
   flutterwave: new FlutterwaveProvider()
 };
@@ -226,173 +205,20 @@ const earningsService = createEarningsService(db);
 const webhookService = new WebhookService(db);
 
 
-db.exec(`
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  account_id TEXT UNIQUE,
-  full_name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  password_hash TEXT NOT NULL,
-  currency TEXT NOT NULL DEFAULT 'USD',
-  balance REAL NOT NULL DEFAULT 0,
-  referral_code TEXT UNIQUE,
-  avatar_url TEXT,
-  created_at TEXT NOT NULL
+await db.exec(
+  await (await import("node:fs/promises")).readFile(
+    new URL("../scripts/create-postgres-schema.sql", import.meta.url),
+    "utf8"
+  )
 );
 
-CREATE TABLE IF NOT EXISTS notifications (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  title TEXT NOT NULL,
-  message TEXT NOT NULL,
-  read INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_notifications_user
-ON notifications(user_id, read, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS transactions (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  amount REAL NOT NULL,
-  currency TEXT NOT NULL,
-  description TEXT,
-  related_user_id TEXT,
-  status TEXT NOT NULL DEFAULT 'completed',
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS payment_intents (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  provider TEXT NOT NULL,
-  provider_reference TEXT,
-  amount REAL NOT NULL,
-  currency TEXT NOT NULL,
-  type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')),
-  status TEXT NOT NULL DEFAULT 'pending'
-    CHECK(status IN ('pending','processing','completed','failed','cancelled')),
-  description TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_provider_reference
-ON payment_intents(provider, provider_reference)
-WHERE provider_reference IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_payment_intents_user
-ON payment_intents(user_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS ledger_entries (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  payment_intent_id TEXT,
-  transaction_id TEXT,
-  entry_type TEXT NOT NULL CHECK(entry_type IN ('credit','debit')),
-  amount REAL NOT NULL,
-  currency TEXT NOT NULL,
-  description TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id),
-  FOREIGN KEY(payment_intent_id) REFERENCES payment_intents(id),
-  FOREIGN KEY(transaction_id) REFERENCES transactions(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_ledger_user
-ON ledger_entries(user_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS payment_webhooks (
-  id TEXT PRIMARY KEY,
-  provider TEXT NOT NULL,
-  provider_event_id TEXT,
-  event_type TEXT,
-  payload_hash TEXT NOT NULL,
-  processed INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  processed_at TEXT
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_provider_event
-ON payment_webhooks(provider, provider_event_id)
-WHERE provider_event_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_payment_webhooks_hash
-ON payment_webhooks(payload_hash);
-
-CREATE INDEX IF NOT EXISTS idx_transactions_user
-ON transactions(user_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS referral_codes (
-  user_id TEXT PRIMARY KEY,
-  code TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS referrals (
-  id TEXT PRIMARY KEY,
-  referrer_id TEXT NOT NULL,
-  referred_id TEXT NOT NULL UNIQUE,
-  referral_code TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  qualifying_payment_id TEXT,
-  reward_amount REAL NOT NULL DEFAULT 5,
-  reward_currency TEXT NOT NULL DEFAULT 'USD',
-  rewarded_at TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(referrer_id) REFERENCES users(id),
-  FOREIGN KEY(referred_id) REFERENCES users(id),
-  FOREIGN KEY(qualifying_payment_id) REFERENCES payment_intents(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_referrals_referrer
-ON referrals(referrer_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS earning_transactions (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  amount REAL NOT NULL,
-  currency TEXT NOT NULL,
-  description TEXT NOT NULL,
-  referral_id TEXT,
-  transaction_id TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id),
-  FOREIGN KEY(referral_id) REFERENCES referrals(id),
-  FOREIGN KEY(transaction_id) REFERENCES transactions(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_earning_transactions_user
-ON earning_transactions(user_id, created_at DESC);
-
-`);
 
 
-try {
-  const userColumns = db.prepare("PRAGMA table_info(users)").all();
-  if (!userColumns.some((column) => column.name === "avatar_url")) {
-    db.exec("ALTER TABLE users ADD COLUMN avatar_url TEXT");
-    console.log("Added users.avatar_url");
-  }
-} catch (error) {
-  console.error("Avatar database migration error:", error);
-}
 
 const id = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 
-function createNotification({
+async function createNotification({
   userId,
   type = "activity",
   title,
@@ -402,7 +228,7 @@ function createNotification({
 
   const notificationId = id();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO notifications
     (id, user_id, type, title, message, read, created_at)
     VALUES (?, ?, ?, ?, ?, 0, ?)
@@ -418,7 +244,7 @@ function createNotification({
   return notificationId;
 }
 
-function notifyOwner({
+async function notifyOwner({
   type = "owner_activity",
   title,
   message
@@ -430,7 +256,7 @@ function notifyOwner({
     return null;
   }
 
-  const owner = db.prepare(`
+  const owner = await db.prepare(`
     SELECT id
     FROM users
     WHERE lower(email) = lower(?)
@@ -450,7 +276,7 @@ function notifyOwner({
   });
 }
 
-const moveWalletFunds = ({
+const moveWalletFunds = async ({
   senderId,
   recipientId,
   amount,
@@ -461,16 +287,16 @@ const moveWalletFunds = ({
     throw new Error("Invalid transfer amount");
   }
 
-  db.exec("BEGIN");
+  await db.exec("BEGIN");
 
   try {
-    const sender = db.prepare(`
+    const sender = await db.prepare(`
       SELECT id, account_id, balance, currency
       FROM users
       WHERE id = ?
     `).get(senderId);
 
-    const recipient = db.prepare(`
+    const recipient = await db.prepare(`
       SELECT id, account_id, full_name, balance, currency
       FROM users
       WHERE id = ?
@@ -491,7 +317,7 @@ const moveWalletFunds = ({
     const sentId = id();
     const receivedId = id();
 
-    const debit = db.prepare(`
+    const debit = await db.prepare(`
       UPDATE users
       SET balance = balance - ?
       WHERE id = ? AND balance >= ?
@@ -501,7 +327,7 @@ const moveWalletFunds = ({
       throw new Error("Transfer could not debit sender balance");
     }
 
-    const credit = db.prepare(`
+    const credit = await db.prepare(`
       UPDATE users
       SET balance = balance + ?
       WHERE id = ?
@@ -511,7 +337,7 @@ const moveWalletFunds = ({
       throw new Error("Transfer could not credit recipient balance");
     }
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO transactions
       (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
       VALUES (?, ?, 'transfer_sent', ?, ?, ?, ?, 'completed', ?)
@@ -525,7 +351,7 @@ const moveWalletFunds = ({
       createdAt
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO transactions
       (id,user_id,type,amount,currency,description,related_user_id,status,created_at)
       VALUES (?, ?, 'transfer_received', ?, ?, ?, ?, 'completed', ?)
@@ -539,7 +365,7 @@ const moveWalletFunds = ({
       createdAt
     );
 
-    db.exec("COMMIT");
+    await db.exec("COMMIT");
 
     return {
       transaction_id: sentId,
@@ -547,7 +373,7 @@ const moveWalletFunds = ({
     };
   } catch (error) {
     try {
-      db.exec("ROLLBACK");
+      await db.exec("ROLLBACK");
     } catch {}
 
     throw error;
@@ -575,6 +401,7 @@ function userData(user) {
   return {
     id: user.id,
     account_id: user.account_id,
+      vicky_id: user.account_id,
     full_name: user.full_name,
     email: user.email,
     currency: user.currency,
@@ -584,7 +411,7 @@ function userData(user) {
   };
 }
 
-function auth(req, res, next) {
+async function auth(req, res, next) {
   try {
     const header = req.headers.authorization || "";
     const accessToken = header.startsWith("Bearer ")
@@ -597,7 +424,7 @@ function auth(req, res, next) {
 
     const payload = jwt.verify(accessToken, JWT_SECRET);
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT id, account_id, full_name, email, currency, balance, referral_code, created_at
       FROM users WHERE id = ?
     `).get(payload.sub);
@@ -613,25 +440,25 @@ function auth(req, res, next) {
   }
 }
 
-app.get("/", (req, res) => {
+app.get("/", async (req, res) => {
   res.json({
     name: "Vicky Pay API",
     status: "online",
-    database: "SQLite",
+    database: "PostgreSQL",
     version: "2.0.0"
   });
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
   res.json({
     status: "ok",
-    database: "SQLite",
+    database: "PostgreSQL",
     time: now()
   });
 });
 
 
-function generateReferralCode(fullName = "") {
+async function generateReferralCode(fullName = "") {
   const clean = String(fullName)
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "");
@@ -644,14 +471,14 @@ function generateReferralCode(fullName = "") {
     const random = crypto.randomBytes(3).toString("hex").toUpperCase();
     code = `${prefix}-${random}`;
   } while (
-    db.prepare("SELECT 1 FROM referral_codes WHERE code = ?").get(code)
+    await db.prepare("SELECT 1 FROM referral_codes WHERE code = ?").get(code)
   );
 
   return code;
 }
 
-function ensureReferralCode(userId, fullName = "") {
-  const existing = db.prepare(`
+async function ensureReferralCode(userId, fullName = "") {
+  const existing = await db.prepare(`
     SELECT code
     FROM referral_codes
     WHERE user_id = ?
@@ -661,7 +488,7 @@ function ensureReferralCode(userId, fullName = "") {
 
   const code = generateReferralCode(fullName);
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO referral_codes
     (user_id, code, created_at)
     VALUES (?, ?, ?)
@@ -670,7 +497,7 @@ function ensureReferralCode(userId, fullName = "") {
   return code;
 }
 
-function createReferral({
+async function createReferral({
   referrerId,
   referredId,
   referralCode
@@ -683,7 +510,7 @@ function createReferral({
     return null;
   }
 
-  const existing = db.prepare(`
+  const existing = await db.prepare(`
     SELECT *
     FROM referrals
     WHERE referred_id = ?
@@ -692,7 +519,7 @@ function createReferral({
 
   if (existing) return existing;
 
-  const referrer = db.prepare(`
+  const referrer = await db.prepare(`
     SELECT id
     FROM users
     WHERE id = ?
@@ -708,7 +535,7 @@ function createReferral({
     referralCode: String(referralCode).trim().toUpperCase()
   };
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO referrals
     (
       id,
@@ -731,14 +558,14 @@ function createReferral({
     now()
   );
 
-  return db.prepare(`
+  return await db.prepare(`
     SELECT *
     FROM referrals
     WHERE id = ?
   `).get(referral.id);
 }
 
-function rewardReferralForDeposit({
+async function rewardReferralForDeposit({
   referredUserId,
   paymentIntentId
 }) {
@@ -754,7 +581,7 @@ function rewardReferralForDeposit({
     process.env.REFERRAL_REWARD_CURRENCY || "USD"
   ).toUpperCase();
 
-  const referral = db.prepare(`
+  const referral = await db.prepare(`
     SELECT *
     FROM referrals
     WHERE referred_id = ?
@@ -775,7 +602,7 @@ function rewardReferralForDeposit({
     return null;
   }
 
-  const payment = db.prepare(`
+  const payment = await db.prepare(`
     SELECT *
     FROM payment_intents
     WHERE id = ?
@@ -796,7 +623,7 @@ function rewardReferralForDeposit({
     return null;
   }
 
-  const referrer = db.prepare(`
+  const referrer = await db.prepare(`
     SELECT *
     FROM users
     WHERE id = ?
@@ -805,7 +632,7 @@ function rewardReferralForDeposit({
 
   if (!referrer) return null;
 
-  const referred = db.prepare(`
+  const referred = await db.prepare(`
     SELECT *
     FROM users
     WHERE id = ?
@@ -816,7 +643,7 @@ function rewardReferralForDeposit({
 
   if (referrer.id === referred.id) return null;
 
-  const existingReward = db.prepare(`
+  const existingReward = await db.prepare(`
     SELECT *
     FROM earning_transactions
     WHERE referral_id = ?
@@ -825,7 +652,7 @@ function rewardReferralForDeposit({
   `).get(referral.id);
 
   if (existingReward) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE referrals
       SET status = 'rewarded',
           qualifying_payment_id = COALESCE(qualifying_payment_id, ?),
@@ -848,7 +675,7 @@ function rewardReferralForDeposit({
   const earningId = id();
   const createdAt = now();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO earning_transactions
     (
       id,
@@ -872,7 +699,7 @@ function rewardReferralForDeposit({
     createdAt
   );
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE referrals
     SET
       status = 'rewarded',
@@ -898,7 +725,7 @@ function rewardReferralForDeposit({
 }
 
 
-function generateAccountId() {
+async function generateAccountId() {
   let accountId;
 
   do {
@@ -906,7 +733,7 @@ function generateAccountId() {
       "VW-" +
       Math.floor(10000000 + Math.random() * 90000000);
   } while (
-    db.prepare(
+    await db.prepare(
       "SELECT 1 FROM users WHERE account_id = ?"
     ).get(accountId)
   );
@@ -914,7 +741,7 @@ function generateAccountId() {
   return accountId;
 }
 
-app.post("/auth/register", authLimiter, async (req, res) => {
+app.post ("/auth/register", authLimiter, async (req, res) => {
   try {
     const fullName = String(
       req.body.full_name || req.body.fullName || ""
@@ -963,7 +790,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
       });
     }
 
-    const existing = db.prepare(
+    const existing = await db.prepare(
       "SELECT id FROM users WHERE lower(email) = lower(?) LIMIT 1"
     ).get(userEmail);
 
@@ -981,7 +808,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
     let referrer = null;
 
     if (referralCode) {
-      referrer = db.prepare(`
+      referrer = await db.prepare(`
         SELECT user_id, code
         FROM referral_codes
         WHERE upper(code) = ?
@@ -1002,7 +829,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
     }
 
     try {
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO users
         (
           id,
@@ -1040,7 +867,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
 
     const ownReferralCode = ensureReferralCode(userId, fullName);
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE users
       SET referral_code = ?
       WHERE id = ?
@@ -1054,7 +881,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
       });
     }
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT
         id,
         account_id,
@@ -1095,7 +922,7 @@ app.post("/auth/register", authLimiter, async (req, res) => {
   }
 });
 
-app.post("/auth/login", authLimiter, async (req, res) => {
+app.post ("/auth/login", authLimiter, async (req, res) => {
   try {
     const userEmail = String(
       email(req.body.email)
@@ -1109,7 +936,7 @@ app.post("/auth/login", authLimiter, async (req, res) => {
       });
     }
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT *
       FROM users
       WHERE lower(email) = lower(?)
@@ -1161,11 +988,11 @@ app.post("/auth/login", authLimiter, async (req, res) => {
 });
 
 
-app.get("/referrals", auth, (req, res) => {
+app.get ("/referrals", auth, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT id, full_name, email, referral_code
       FROM users
       WHERE id = ?
@@ -1177,7 +1004,7 @@ app.get("/referrals", auth, (req, res) => {
       });
     }
 
-    const referrals = db.prepare(`
+    const referrals = await db.prepare(`
       SELECT
         r.id,
         r.referral_code,
@@ -1195,7 +1022,7 @@ app.get("/referrals", auth, (req, res) => {
       ORDER BY r.created_at DESC
     `).all(userId);
 
-    const totals = db.prepare(`
+    const totals = await db.prepare(`
       SELECT
         COUNT(*) AS total,
         COALESCE(SUM(
@@ -1255,7 +1082,7 @@ app.post(
 
       const uploaded = await uploadAvatarToCloudinary(req.file);
 
-      db.prepare(`
+      await db.prepare(`
         UPDATE users
         SET avatar_url = ?
         WHERE id = ?
@@ -1264,7 +1091,7 @@ app.post(
         req.user.id
       );
 
-      const user = db.prepare(`
+      const user = await db.prepare(`
         SELECT
           id,
           account_id,
@@ -1295,7 +1122,7 @@ app.post(
   }
 );
 
-app.patch("/auth/profile", auth, async (req, res) => {
+app.patch ("/auth/profile", auth, async (req, res) => {
   try {
     const fullName = String(req.body.full_name || "").trim();
     const newEmail = email(req.body.email);
@@ -1317,7 +1144,7 @@ app.patch("/auth/profile", auth, async (req, res) => {
       });
     }
 
-    const existingEmail = db.prepare(
+    const existingEmail = await db.prepare(
       "SELECT avatar_url, id FROM users WHERE email = ? AND id != ?"
     ).get(newEmail, req.user.id);
 
@@ -1327,7 +1154,7 @@ app.patch("/auth/profile", auth, async (req, res) => {
       });
     }
 
-    const user = db.prepare(
+    const user = await db.prepare(
       "SELECT * FROM users WHERE id = ?"
     ).get(req.user.id);
 
@@ -1360,7 +1187,7 @@ app.patch("/auth/profile", auth, async (req, res) => {
       passwordHash = await bcrypt.hash(newPassword, 12);
     }
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE users
       SET full_name = ?,
           email = ?,
@@ -1375,7 +1202,7 @@ app.patch("/auth/profile", auth, async (req, res) => {
       req.user.id
     );
 
-    const updatedUser = db.prepare(`
+    const updatedUser = await db.prepare(`
       SELECT id, full_name, email, currency, balance, created_at
       FROM users WHERE id = ?
     `).get(req.user.id);
@@ -1392,13 +1219,208 @@ app.patch("/auth/profile", auth, async (req, res) => {
   }
 });
 
-app.post("/auth/logout", (req, res) => {
+app.post("/auth/logout", async (req, res) => {
   res.clearCookie("token");
   res.json({ message: "Logged out" });
 });
 
-app.get("/wallet/balance", auth, (req, res) => {
-  const user = db.prepare(`
+
+/* ================= REAL CURRENCY EXCHANGE ================= */
+
+const FX_API = "https://api.frankfurter.dev/v2";
+
+const SUPPORTED_EXCHANGE_CURRENCIES = [
+  "USD", "EUR", "GBP", "NGN", "GHS", "KES", "ZAR",
+  "XOF", "CAD", "AUD", "JPY", "CHF"
+];
+
+async function getExchangeRate(from, to) {
+  from = String(from || "").trim().toUpperCase();
+  to = String(to || "").trim().toUpperCase();
+
+  if (!SUPPORTED_EXCHANGE_CURRENCIES.includes(from)) {
+    throw new Error(`Unsupported source currency: ${from}`);
+  }
+
+  if (!SUPPORTED_EXCHANGE_CURRENCIES.includes(to)) {
+    throw new Error(`Unsupported destination currency: ${to}`);
+  }
+
+  if (from === to) {
+    return {
+      date: new Date().toISOString().slice(0, 10),
+      base: from,
+      quote: to,
+      rate: 1
+    };
+  }
+
+  const response = await fetch(
+    `${FX_API}/rate/${encodeURIComponent(from)}/${encodeURIComponent(to)}`
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`FX provider error: ${text || response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (!Number.isFinite(Number(data.rate)) || Number(data.rate) <= 0) {
+    throw new Error("Invalid exchange rate received");
+  }
+
+  return {
+    date: data.date,
+    base: data.base,
+    quote: data.quote,
+    rate: Number(data.rate)
+  };
+}
+
+app.get ("/exchange/rate", auth, async (req, res) => {
+  try {
+    const from = String(req.query.from || "").toUpperCase();
+    const to = String(req.query.to || "").toUpperCase();
+
+    if (!from || !to) {
+      return res.status(400).json({
+        error: "from and to currencies are required"
+      });
+    }
+
+    const rate = await getExchangeRate(from, to);
+
+    return res.json({
+      success: true,
+      ...rate,
+      provider: "Frankfurter"
+    });
+  } catch (error) {
+    console.error("FX rate error:", error);
+
+    return res.status(400).json({
+      error: error.message || "Unable to retrieve exchange rate"
+    });
+  }
+});
+
+app.post("/exchange", auth, async (req, res) => {
+  const from = String(req.body.from_currency || "").trim().toUpperCase();
+  const to = String(req.body.to_currency || "").trim().toUpperCase();
+  const amount = Number(req.body.amount);
+
+  if (!SUPPORTED_EXCHANGE_CURRENCIES.includes(from)) {
+    return res.status(400).json({ error: "Unsupported source currency" });
+  }
+
+  if (!SUPPORTED_EXCHANGE_CURRENCIES.includes(to)) {
+    return res.status(400).json({ error: "Unsupported destination currency" });
+  }
+
+  if (from === to) {
+    return res.status(400).json({
+      error: "Source and destination currencies must be different"
+    });
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({
+      error: "Enter a valid exchange amount"
+    });
+  }
+
+  try {
+    const rateData = await getExchangeRate(from, to);
+
+    /*
+     * This transaction is deliberately performed entirely on the
+     * server. The client cannot choose the conversion result.
+     */
+    await db.exec("BEGIN");
+
+    try {
+      const user = await db.prepare(`
+        SELECT *
+        FROM users
+        WHERE id = ?
+      `).get(req.user.id);
+
+      if (!user) {
+        throw new Error("User account not found");
+      }
+
+      /*
+       * Current Vicky Pay schema has one balance/currency per user.
+       * Therefore a real multi-currency exchange cannot safely be
+       * performed until destination currency balances exist.
+       *
+       * Do not silently change the user's currency or pretend that
+       * one balance represents multiple currencies.
+       */
+      if (String(user.currency).toUpperCase() !== from) {
+        throw new Error(
+          `Your current wallet is ${user.currency}. A ${from} wallet is required.`
+        );
+      }
+
+      if (Number(user.balance) < amount) {
+        throw new Error("Insufficient balance");
+      }
+
+      const convertedAmount = amount * rateData.rate;
+
+      const exchangeId = crypto.randomUUID();
+      const transactionId = crypto.randomUUID();
+      const debitLedgerId = crypto.randomUUID();
+      const creditLedgerId = crypto.randomUUID();
+      const timestamp = now();
+
+      /*
+       * IMPORTANT:
+       * The current schema does not yet have separate balances per
+       * currency. Therefore we do NOT perform a fake cross-currency
+       * balance mutation here.
+       *
+       * This endpoint currently returns the locked quote only.
+       * Actual multi-currency settlement requires the wallets table.
+       */
+      await db.exec("ROLLBACK");
+
+      return res.status(409).json({
+        error:
+          "Exchange quote is available, but multi-currency settlement is not enabled yet. Create separate currency wallets before moving real funds.",
+        exchange: {
+          id: exchangeId,
+          from_currency: from,
+          to_currency: to,
+          from_amount: amount,
+          rate: rateData.rate,
+          to_amount: convertedAmount,
+          rate_date: rateData.date,
+          provider: "Frankfurter"
+        }
+      });
+
+    } catch (innerError) {
+      try {
+        await db.exec("ROLLBACK");
+      } catch {}
+      throw innerError;
+    }
+
+  } catch (error) {
+    console.error("Exchange error:", error);
+
+    return res.status(400).json({
+      error: error.message || "Exchange failed"
+    });
+  }
+});
+
+
+app.get ("/wallet/balance", auth, async (req, res) => {
+  const user = await db.prepare(`
     SELECT balance, currency FROM users WHERE id = ?
   `).get(req.user.id);
 
@@ -1438,7 +1460,7 @@ async function settleFlutterwaveDeposit({
     );
   }
 
-  const payment = db.prepare(`
+  const payment = await db.prepare(`
     SELECT *
     FROM payment_intents
     WHERE provider = 'flutterwave'
@@ -1504,10 +1526,10 @@ async function settleFlutterwaveDeposit({
     );
   }
 
-  db.exec("BEGIN IMMEDIATE");
+  await db.exec("BEGIN");
 
   try {
-    const currentPayment = db.prepare(`
+    const currentPayment = await db.prepare(`
       SELECT *
       FROM payment_intents
       WHERE id = ?
@@ -1520,7 +1542,7 @@ async function settleFlutterwaveDeposit({
     }
 
     if (currentPayment.status === "completed") {
-      db.exec("COMMIT");
+      await db.exec("COMMIT");
 
       return {
         already_completed: true,
@@ -1528,7 +1550,7 @@ async function settleFlutterwaveDeposit({
       };
     }
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT id, balance, currency
       FROM users
       WHERE id = ?
@@ -1545,7 +1567,7 @@ async function settleFlutterwaveDeposit({
      * if this payment intent already has a credit
      * ledger entry, do not credit the wallet again.
      */
-    const existingCredit = db.prepare(`
+    const existingCredit = await db.prepare(`
       SELECT id
       FROM ledger_entries
       WHERE payment_intent_id = ?
@@ -1554,7 +1576,7 @@ async function settleFlutterwaveDeposit({
     `).get(currentPayment.id);
 
     if (existingCredit) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE payment_intents
         SET status = 'completed',
             updated_at = ?
@@ -1564,11 +1586,11 @@ async function settleFlutterwaveDeposit({
         currentPayment.id
       );
 
-      db.exec("COMMIT");
+      await db.exec("COMMIT");
 
       return {
         already_completed: true,
-        payment: db.prepare(`
+        payment: await db.prepare(`
           SELECT *
           FROM payment_intents
           WHERE id = ?
@@ -1579,7 +1601,7 @@ async function settleFlutterwaveDeposit({
     const transactionIdNew = id();
     const createdAt = now();
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE users
       SET balance = balance + ?
       WHERE id = ?
@@ -1588,7 +1610,7 @@ async function settleFlutterwaveDeposit({
       user.id
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO transactions
       (
         id,
@@ -1612,7 +1634,7 @@ async function settleFlutterwaveDeposit({
       createdAt
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO ledger_entries
       (
         id,
@@ -1638,7 +1660,7 @@ async function settleFlutterwaveDeposit({
       createdAt
     );
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE payment_intents
       SET status = 'completed',
           updated_at = ?
@@ -1660,7 +1682,7 @@ async function settleFlutterwaveDeposit({
       throw referralError;
     }
 
-    db.exec("COMMIT");
+    await db.exec("COMMIT");
 
     createNotification({
       userId: user.id,
@@ -1687,14 +1709,14 @@ async function settleFlutterwaveDeposit({
     };
   } catch (error) {
     try {
-      db.exec("ROLLBACK");
+      await db.exec("ROLLBACK");
     } catch {}
 
     throw error;
   }
 }
 
-app.post("/payments/webhook/flutterwave", async (req, res) => {
+app.post ("/payments/webhook/flutterwave", async (req, res) => {
   try {
     const provider =
       paymentService.getProvider("flutterwave");
@@ -1782,7 +1804,7 @@ app.post("/payments/webhook/flutterwave", async (req, res) => {
               payload.data?.status
         });
 
-        db.prepare(`
+        await db.prepare(`
           UPDATE payment_webhooks
           SET processed = 1,
               processed_at = ?
@@ -1844,7 +1866,7 @@ app.post("/payments/webhook/flutterwave", async (req, res) => {
       }
     }
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE payment_webhooks
       SET processed = 1,
           processed_at = ?
@@ -1877,14 +1899,14 @@ app.post("/payments/webhook/flutterwave", async (req, res) => {
 });
 
 
-function getUserLinkedFinancialAccount(userId, accountId) {
+async function getUserLinkedFinancialAccount(userId, accountId) {
   const id = Number(accountId);
 
   if (!Number.isInteger(id) || id <= 0) {
     return null;
   }
 
-  return db.prepare(`
+  return await db.prepare(`
     SELECT
       id,
       user_id,
@@ -1905,7 +1927,7 @@ function getUserLinkedFinancialAccount(userId, accountId) {
   `).get(id, userId);
 }
 
-app.post("/payments/deposit", auth, async (req, res) => {
+app.post ("/payments/deposit", auth, async (req, res) => {
   try {
     const value = Number(req.body.amount);
 
@@ -1995,7 +2017,7 @@ app.post("/payments/deposit", auth, async (req, res) => {
           "https://vicky-wallet-frontend.onrender.com/payment/callback"
       });
 
-      db.prepare(`
+      await db.prepare(`
         UPDATE payment_intents
         SET provider_reference = ?,
             status = 'processing',
@@ -2071,7 +2093,7 @@ async function settleFlutterwaveWithdrawal({
 }) {
   const provider = paymentService.getProvider("flutterwave");
 
-  const payment = db.prepare(`
+  const payment = await db.prepare(`
     SELECT *
     FROM payment_intents
     WHERE provider = 'flutterwave'
@@ -2152,10 +2174,10 @@ async function settleFlutterwaveWithdrawal({
     };
   }
 
-  db.exec("BEGIN IMMEDIATE");
+  await db.exec("BEGIN");
 
   try {
-    const currentPayment = db.prepare(`
+    const currentPayment = await db.prepare(`
       SELECT *
       FROM payment_intents
       WHERE id = ?
@@ -2170,7 +2192,7 @@ async function settleFlutterwaveWithdrawal({
       currentPayment.status === "failed" ||
       currentPayment.status === "cancelled"
     ) {
-      db.exec("COMMIT");
+      await db.exec("COMMIT");
 
       return {
         already_finalized: true,
@@ -2179,7 +2201,7 @@ async function settleFlutterwaveWithdrawal({
       };
     }
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT id, balance, currency
       FROM users
       WHERE id = ?
@@ -2189,7 +2211,7 @@ async function settleFlutterwaveWithdrawal({
       throw new Error("Withdrawal owner not found");
     }
 
-    const withdrawalTransaction = db.prepare(`
+    const withdrawalTransaction = await db.prepare(`
       SELECT *
       FROM transactions
       WHERE user_id = ?
@@ -2203,7 +2225,7 @@ async function settleFlutterwaveWithdrawal({
     );
 
     if (successful) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE payment_intents
         SET status = 'completed',
             updated_at = ?
@@ -2214,14 +2236,14 @@ async function settleFlutterwaveWithdrawal({
       );
 
       if (withdrawalTransaction) {
-        db.prepare(`
+        await db.prepare(`
           UPDATE transactions
           SET status = 'completed'
           WHERE id = ?
         `).run(withdrawalTransaction.id);
       }
 
-      db.exec("COMMIT");
+      await db.exec("COMMIT");
 
       createNotification({
         userId: user.id,
@@ -2234,7 +2256,7 @@ async function settleFlutterwaveWithdrawal({
       return {
         already_completed: false,
         status: "completed",
-        payment: db.prepare(`
+        payment: await db.prepare(`
           SELECT *
           FROM payment_intents
           WHERE id = ?
@@ -2248,7 +2270,7 @@ async function settleFlutterwaveWithdrawal({
      * was created. The refund ledger entry makes the reversal
      * auditable.
      */
-    db.prepare(`
+    await db.prepare(`
       UPDATE users
       SET balance = balance + ?
       WHERE id = ?
@@ -2259,7 +2281,7 @@ async function settleFlutterwaveWithdrawal({
 
     const refundTransactionId = id();
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO transactions
       (
         id,
@@ -2282,7 +2304,7 @@ async function settleFlutterwaveWithdrawal({
       now()
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO ledger_entries
       (
         id,
@@ -2307,7 +2329,7 @@ async function settleFlutterwaveWithdrawal({
       now()
     );
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE payment_intents
       SET status = ?,
           updated_at = ?
@@ -2319,14 +2341,14 @@ async function settleFlutterwaveWithdrawal({
     );
 
     if (withdrawalTransaction) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE transactions
         SET status = 'failed'
         WHERE id = ?
       `).run(withdrawalTransaction.id);
     }
 
-    db.exec("COMMIT");
+    await db.exec("COMMIT");
 
     createNotification({
       userId: user.id,
@@ -2340,7 +2362,7 @@ async function settleFlutterwaveWithdrawal({
       already_completed: false,
       status: status === "cancelled" ? "cancelled" : "failed",
       refunded: true,
-      payment: db.prepare(`
+      payment: await db.prepare(`
         SELECT *
         FROM payment_intents
         WHERE id = ?
@@ -2348,14 +2370,14 @@ async function settleFlutterwaveWithdrawal({
     };
   } catch (error) {
     try {
-      db.exec("ROLLBACK");
+      await db.exec("ROLLBACK");
     } catch {}
     throw error;
   }
 }
 
 
-app.post("/wallet/withdraw", auth, async (req, res) => {
+app.post ("/wallet/withdraw", auth, async (req, res) => {
   try {
     const value = Number(req.body?.amount);
 
@@ -2425,7 +2447,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
       });
     }
 
-    const user = db.prepare(`
+    const user = await db.prepare(`
       SELECT id, account_id, full_name, email, currency, balance
       FROM users
       WHERE id = ?
@@ -2452,9 +2474,9 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
     });
 
     try {
-      db.exec("BEGIN IMMEDIATE");
+      await db.exec("BEGIN");
 
-      const currentUser = db.prepare(`
+      const currentUser = await db.prepare(`
         SELECT id, balance, currency
         FROM users
         WHERE id = ?
@@ -2468,7 +2490,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
         throw new Error("Insufficient balance");
       }
 
-      const debit = db.prepare(`
+      const debit = await db.prepare(`
         UPDATE users
         SET balance = balance - ?
         WHERE id = ?
@@ -2485,7 +2507,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
 
       const transactionId = id();
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO transactions
         (
           id,
@@ -2508,7 +2530,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
         now()
       );
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO ledger_entries
         (
           id,
@@ -2533,10 +2555,10 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
         now()
       );
 
-      db.exec("COMMIT");
+      await db.exec("COMMIT");
     } catch (reservationError) {
       try {
-        db.exec("ROLLBACK");
+        await db.exec("ROLLBACK");
       } catch {}
 
       paymentService.updateStatus(
@@ -2588,7 +2610,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
       const finalPayment =
         paymentService.getPaymentIntent(payment.id);
 
-      const updatedUser = db.prepare(`
+      const updatedUser = await db.prepare(`
         SELECT balance, currency
         FROM users
         WHERE id = ?
@@ -2638,7 +2660,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
        * provider reference. Release the reserved balance.
        */
       try {
-        db.exec("BEGIN IMMEDIATE");
+        await db.exec("BEGIN");
 
         const currentPayment =
           paymentService.getPaymentIntent(payment.id);
@@ -2649,7 +2671,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
           currentPayment.status !== "failed" &&
           currentPayment.status !== "cancelled"
         ) {
-          db.prepare(`
+          await db.prepare(`
             UPDATE users
             SET balance = balance + ?
             WHERE id = ?
@@ -2660,7 +2682,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
 
           const refundTransactionId = id();
 
-          db.prepare(`
+          await db.prepare(`
             INSERT INTO transactions
             (
               id,
@@ -2683,7 +2705,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
             now()
           );
 
-          db.prepare(`
+          await db.prepare(`
             INSERT INTO ledger_entries
             (
               id,
@@ -2708,7 +2730,7 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
             now()
           );
 
-          db.prepare(`
+          await db.prepare(`
             UPDATE payment_intents
             SET status = 'failed',
                 updated_at = ?
@@ -2719,10 +2741,10 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
           );
         }
 
-        db.exec("COMMIT");
+        await db.exec("COMMIT");
       } catch (refundError) {
         try {
-          db.exec("ROLLBACK");
+          await db.exec("ROLLBACK");
         } catch {}
 
         console.error(
@@ -2758,9 +2780,9 @@ app.post("/wallet/withdraw", auth, async (req, res) => {
 });
 
 
-app.get("/wallet/withdraw/:paymentId", auth, async (req, res) => {
+app.get ("/wallet/withdraw/:paymentId", auth, async (req, res) => {
   try {
-    const payment = db.prepare(`
+    const payment = await db.prepare(`
       SELECT *
       FROM payment_intents
       WHERE id = ?
@@ -2841,9 +2863,9 @@ app.get("/wallet/withdraw/:paymentId", auth, async (req, res) => {
 
 
 
-app.get("/payments/:paymentId", auth, (req, res) => {
+app.get ("/payments/:paymentId", auth, async (req, res) => {
   try {
-    const payment = db.prepare(`
+    const payment = await db.prepare(`
       SELECT
         id,
         provider,
@@ -2888,7 +2910,7 @@ app.get("/payments/:paymentId", auth, (req, res) => {
   }
 });
 
-app.get("/wallet/recipient/:accountId", auth, (req, res) => {
+app.get ("/wallet/recipient/:accountId", auth, async (req, res) => {
   try {
     const accountId = String(req.params.accountId || "").trim().toUpperCase();
 
@@ -2904,7 +2926,7 @@ app.get("/wallet/recipient/:accountId", auth, (req, res) => {
       });
     }
 
-    const recipient = db.prepare(`
+    const recipient = await db.prepare(`
       SELECT account_id, full_name, currency
       FROM users
       WHERE account_id = ?
@@ -2929,7 +2951,7 @@ app.get("/wallet/recipient/:accountId", auth, (req, res) => {
   }
 });
 
-app.post("/wallet/transfer", auth, (req, res) => {
+app.post ("/wallet/transfer", auth, async (req, res) => {
   try {
     const recipientAccountId = String(
       req.body.recipient_account_id ||
@@ -2958,7 +2980,7 @@ app.post("/wallet/transfer", auth, (req, res) => {
       });
     }
 
-    const recipient = db.prepare(`
+    const recipient = await db.prepare(`
       SELECT id, account_id, full_name, currency
       FROM users
       WHERE account_id = ?
@@ -2970,7 +2992,7 @@ app.post("/wallet/transfer", auth, (req, res) => {
       });
     }
 
-    const sender = db.prepare(`
+    const sender = await db.prepare(`
       SELECT id, account_id, balance, currency
       FROM users
       WHERE id = ?
@@ -2986,7 +3008,7 @@ app.post("/wallet/transfer", auth, (req, res) => {
       req.body.description || "Wallet transfer"
     ).trim();
 
-    const result = moveWalletFunds({
+    const result = await moveWalletFunds({
       senderId: sender.id,
       recipientId: recipient.id,
       amount: value,
@@ -3008,7 +3030,7 @@ app.post("/wallet/transfer", auth, (req, res) => {
       message: `You received ${value} ${sender.currency} from ${sender.account_id}.`
     });
 
-    const updatedSender = db.prepare(`
+    const updatedSender = await db.prepare(`
       SELECT balance, currency
       FROM users
       WHERE id = ?
@@ -3046,14 +3068,14 @@ app.post("/wallet/transfer", auth, (req, res) => {
   }
 });
 
-app.get("/notifications", auth, (req, res) => {
+app.get ("/notifications", auth, async (req, res) => {
   try {
     const limit = Math.min(
       Math.max(Number(req.query.limit) || 50, 1),
       100
     );
 
-    const notifications = db.prepare(`
+    const notifications = await db.prepare(`
       SELECT id, type, title, message, read, created_at
       FROM notifications
       WHERE user_id = ?
@@ -3061,7 +3083,7 @@ app.get("/notifications", auth, (req, res) => {
       LIMIT ?
     `).all(req.user.id, limit);
 
-    const unread = db.prepare(`
+    const unread = await db.prepare(`
       SELECT COUNT(*) AS count
       FROM notifications
       WHERE user_id = ?
@@ -3080,9 +3102,9 @@ app.get("/notifications", auth, (req, res) => {
   }
 });
 
-app.patch("/notifications/:id/read", auth, (req, res) => {
+app.patch ("/notifications/:id/read", auth, async (req, res) => {
   try {
-    const result = db.prepare(`
+    const result = await db.prepare(`
       UPDATE notifications
       SET read = 1
       WHERE id = ?
@@ -3109,9 +3131,9 @@ app.patch("/notifications/:id/read", auth, (req, res) => {
   }
 });
 
-app.post("/notifications/read-all", auth, (req, res) => {
+app.post ("/notifications/read-all", auth, async (req, res) => {
   try {
-    db.prepare(`
+    await db.prepare(`
       UPDATE notifications
       SET read = 1
       WHERE user_id = ?
@@ -3129,13 +3151,13 @@ app.post("/notifications/read-all", auth, (req, res) => {
   }
 });
 
-app.get("/wallet/transactions", auth, (req, res) => {
+app.get ("/wallet/transactions", auth, async (req, res) => {
   const limit = Math.min(
     Math.max(Number(req.query.limit) || 50, 1),
     100
   );
 
-  const transactions = db.prepare(`
+  const transactions = await db.prepare(`
     SELECT id,type,amount,currency,description,
            related_user_id,status,created_at
     FROM transactions
@@ -3205,46 +3227,11 @@ app.get("/earnings/history", auth, (req, res) => {
 
 // ==================== LINKED FINANCIAL ACCOUNTS ====================
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS linked_accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    provider TEXT NOT NULL,
-    provider_account_id TEXT NOT NULL,
-    account_name TEXT,
-    masked_account_number TEXT,
-    account_type TEXT,
-    currency TEXT NOT NULL DEFAULT 'NGN',
-    balance REAL NOT NULL DEFAULT 0,
-    balance_updated_at TEXT,
-    status TEXT NOT NULL DEFAULT 'connected',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, provider, provider_account_id),
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
 
-  CREATE INDEX IF NOT EXISTS idx_linked_accounts_user
-  ON linked_accounts(user_id, updated_at DESC);
 
-  CREATE TABLE IF NOT EXISTS financial_account_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    linked_account_id INTEGER,
-    user_id INTEGER,
-    provider TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    event_id TEXT,
-    payload TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_financial_events_user
-  ON financial_account_events(user_id, created_at DESC);
-`);
-
-app.get("/linked-accounts", auth, (req, res) => {
+app.get ("/linked-accounts", auth, async (req, res) => {
   try {
-    const accounts = db.prepare(`
+    const accounts = await db.prepare(`
       SELECT
         id,
         provider,
@@ -3277,9 +3264,9 @@ app.get("/linked-accounts", auth, (req, res) => {
   }
 });
 
-app.get("/linked-accounts/summary", auth, (req, res) => {
+app.get ("/linked-accounts/summary", auth, async (req, res) => {
   try {
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT currency, COALESCE(SUM(balance), 0) AS total
       FROM linked_accounts
       WHERE user_id = ?
@@ -3301,9 +3288,9 @@ app.get("/linked-accounts/summary", auth, (req, res) => {
   }
 });
 
-app.get("/linked-accounts/:id", auth, (req, res) => {
+app.get ("/linked-accounts/:id", auth, async (req, res) => {
   try {
-    const account = db.prepare(`
+    const account = await db.prepare(`
       SELECT
         id,
         provider,
@@ -3342,9 +3329,9 @@ app.get("/linked-accounts/:id", auth, (req, res) => {
   }
 });
 
-app.delete("/linked-accounts/:id", auth, (req, res) => {
+app.delete ("/linked-accounts/:id", auth, async (req, res) => {
   try {
-    const account = db.prepare(`
+    const account = await db.prepare(`
       SELECT id
       FROM linked_accounts
       WHERE id = ?
@@ -3357,7 +3344,7 @@ app.delete("/linked-accounts/:id", auth, (req, res) => {
       });
     }
 
-    db.prepare(`
+    await db.prepare(`
       DELETE FROM linked_accounts
       WHERE id = ?
         AND user_id = ?
@@ -3376,7 +3363,7 @@ app.delete("/linked-accounts/:id", auth, (req, res) => {
 
 // Provider callback/event endpoint.
 // Individual providers must be validated before updating balances.
-app.post("/webhooks/financial/:provider", (req, res) => {
+app.post("/webhooks/financial/:provider", async (req, res) => {
   try {
     const provider = String(req.params.provider || "").trim().toLowerCase();
 
@@ -3401,7 +3388,7 @@ app.post("/webhooks/financial/:provider", (req, res) => {
 
 // ==================== OWNER / ADMIN API ====================
 
-function adminAuth(req, res, next) {
+async function adminAuth(req, res, next) {
   auth(req, res, () => {
     const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 
@@ -3421,21 +3408,21 @@ function adminAuth(req, res, next) {
   });
 }
 
-app.get("/admin/stats", adminAuth, (req, res) => {
-  const users = db.prepare(`
+app.get ("/admin/stats", adminAuth, async (req, res) => {
+  const users = await db.prepare(`
     SELECT COUNT(*) AS count FROM users
   `).get();
 
-  const balances = db.prepare(`
+  const balances = await db.prepare(`
     SELECT COALESCE(SUM(balance), 0) AS total
     FROM users
   `).get();
 
-  const transactions = db.prepare(`
+  const transactions = await db.prepare(`
     SELECT COUNT(*) AS count FROM transactions
   `).get();
 
-  const deposits = db.prepare(`
+  const deposits = await db.prepare(`
     SELECT
       COUNT(*) AS count,
       COALESCE(SUM(amount), 0) AS total
@@ -3443,7 +3430,7 @@ app.get("/admin/stats", adminAuth, (req, res) => {
     WHERE type = 'deposit'
   `).get();
 
-  const withdrawals = db.prepare(`
+  const withdrawals = await db.prepare(`
     SELECT
       COUNT(*) AS count,
       COALESCE(SUM(amount), 0) AS total
@@ -3451,7 +3438,7 @@ app.get("/admin/stats", adminAuth, (req, res) => {
     WHERE type = 'withdraw'
   `).get();
 
-  const transfers = db.prepare(`
+  const transfers = await db.prepare(`
     SELECT
       COUNT(*) AS count,
       COALESCE(SUM(amount), 0) AS total
@@ -3478,13 +3465,13 @@ app.get("/admin/stats", adminAuth, (req, res) => {
   });
 });
 
-app.get("/admin/users", adminAuth, (req, res) => {
+app.get ("/admin/users", adminAuth, async (req, res) => {
   const limit = Math.min(
     Math.max(Number(req.query.limit) || 50, 1),
     100
   );
 
-  const users = db.prepare(`
+  const users = await db.prepare(`
     SELECT id, full_name, email, currency, balance, created_at
     FROM users
     ORDER BY created_at DESC
@@ -3499,13 +3486,13 @@ app.get("/admin/users", adminAuth, (req, res) => {
   });
 });
 
-app.get("/admin/transactions", adminAuth, (req, res) => {
+app.get ("/admin/transactions", adminAuth, async (req, res) => {
   const limit = Math.min(
     Math.max(Number(req.query.limit) || 100, 1),
     200
   );
 
-  const transactions = db.prepare(`
+  const transactions = await db.prepare(`
     SELECT
       t.id,
       t.user_id,
@@ -3532,8 +3519,8 @@ app.get("/admin/transactions", adminAuth, (req, res) => {
   });
 });
 
-app.get("/admin/user/:id", adminAuth, (req, res) => {
-  const user = db.prepare(`
+app.get ("/admin/user/:id", adminAuth, async (req, res) => {
+  const user = await db.prepare(`
     SELECT id, full_name, email, currency, balance, created_at
     FROM users
     WHERE id = ?
@@ -3545,7 +3532,7 @@ app.get("/admin/user/:id", adminAuth, (req, res) => {
     });
   }
 
-  const transactions = db.prepare(`
+  const transactions = await db.prepare(`
     SELECT
       id, type, amount, currency,
       description, related_user_id,
@@ -3583,14 +3570,14 @@ const bootstrapPassword = String(process.env.ADMIN_BOOTSTRAP_PASSWORD || "").tri
 const bootstrapEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 
 if (bootstrapEmail && bootstrapPassword.length >= 8) {
-  const existingOwner = db.prepare(
+  const existingOwner = await db.prepare(
     "SELECT id FROM users WHERE email = ?"
   ).get(bootstrapEmail);
 
   const passwordHash = await bcrypt.hash(bootstrapPassword, 12);
 
   if (existingOwner) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE users
       SET password_hash = ?
       WHERE email = ?
@@ -3598,7 +3585,7 @@ if (bootstrapEmail && bootstrapPassword.length >= 8) {
 
     console.log("🔐 Owner password bootstrapped");
   } else {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO users
       (id, account_id, full_name, email, password_hash, currency, balance, created_at)
       VALUES (?, ?, ?, ?, ?, 'USD', 0, ?)
@@ -3640,7 +3627,7 @@ app.get("/financial/providers", auth, (req, res) => {
 
 // Start official Mono bank authorization.
 // Vicky Pay never receives or stores the user's bank password.
-app.post("/financial/bank/connect", auth, async (req, res) => {
+app.post ("/financial/bank/connect", auth, async (req, res) => {
   try {
     const institution = String(
       req.body?.institution || ""
@@ -3693,7 +3680,7 @@ app.post("/financial/bank/connect", auth, async (req, res) => {
 
 // Exchange the code returned by Mono's official authorization
 // flow, then retrieve the connected account information.
-app.post("/financial/bank/accounts", auth, async (req, res) => {
+app.post ("/financial/bank/accounts", auth, async (req, res) => {
   try {
     const code = String(
       req.body?.code || ""
@@ -3744,7 +3731,7 @@ app.post("/financial/bank/accounts", auth, async (req, res) => {
 // OPay wallet balance.
 // This requires an eligible OPay Business/Digital Wallet
 // integration and its official credentials.
-app.post("/financial/opay/balance", auth, async (req, res) => {
+app.post ("/financial/opay/balance", auth, async (req, res) => {
   try {
     const depositCode = String(
       req.body?.deposit_code ||
@@ -3792,7 +3779,7 @@ app.get("/financial/opay/status", auth, (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Vicky Pay running on port ${PORT}`);
-  console.log(`🗄️ SQLite database: data/vicky-wallet.sqlite`);
+  console.log(`🗄️ PostgreSQL database`);
   console.log(`🔐 JWT authentication enabled`);
 });
 
