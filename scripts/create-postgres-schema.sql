@@ -191,3 +191,16 @@ ON exchange_transactions(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_notifications_user
 ON notifications(user_id, read, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS referral_codes (
+    user_id TEXT PRIMARY KEY REFERENCES users(id),
+    code TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_codes_code
+ON referral_codes(code);
+
+-- Case-insensitive email uniqueness
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower
+ON users (LOWER(email));
