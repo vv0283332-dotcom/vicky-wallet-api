@@ -2910,24 +2910,30 @@ app.get ("/payments/:paymentId", auth, async (req, res) => {
   }
 });
 
-app.get("/wallet/recipient", auth, async (req, res) => {
+app.get("/wallet/recipient/:accountId", auth, async (req, res) => {
   try {
-    const recipientEmail = String(
-      req.query.email || req.query.recipient_email || ""
-    ).trim().toLowerCase();
+    const accountId = String(
+      req.params.accountId || ""
+    ).trim().toUpperCase();
 
-    if (!recipientEmail || !recipientEmail.includes("@")) {
+    if (!/^VW-[0-9]{8}$/.test(accountId)) {
       return res.status(400).json({
-        error: "Valid recipient email is required"
+        error: "Invalid Vicky Account ID"
+      });
+    }
+
+    if (accountId === req.user.account_id) {
+      return res.status(400).json({
+        error: "You cannot select your own account"
       });
     }
 
     const recipient = await db.prepare(`
-      SELECT id, account_id, full_name, email, currency
+      SELECT id, account_id, full_name, currency
       FROM users
-      WHERE lower(email) = lower(?)
+      WHERE account_id = ?
       LIMIT 1
-    `).get(recipientEmail);
+    `).get(accountId);
 
     if (!recipient) {
       return res.status(404).json({
@@ -2935,21 +2941,15 @@ app.get("/wallet/recipient", auth, async (req, res) => {
       });
     }
 
-    if (recipient.id === req.user.id) {
-      return res.status(400).json({
-        error: "You cannot send money to yourself"
-      });
-    }
-
-    res.json({
+    return res.json({
+      account_id: recipient.account_id,
       full_name: recipient.full_name,
-      email: recipient.email,
       currency: recipient.currency
     });
   } catch (error) {
     console.error("Recipient lookup error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "Unable to find recipient"
     });
   }
@@ -2957,18 +2957,18 @@ app.get("/wallet/recipient", auth, async (req, res) => {
 
 app.post("/wallet/transfer", auth, async (req, res) => {
   try {
-    const recipientEmail = String(
-      req.body?.recipient_email ||
-      req.body?.recipientEmail ||
-      req.body?.email ||
+    const recipientAccountId = String(
+      req.body?.recipient_account_id ||
+      req.body?.recipientAccountId ||
+      req.body?.account_id ||
       ""
-    ).trim().toLowerCase();
+    ).trim().toUpperCase();
 
     const value = Number(req.body?.amount);
 
-    if (!recipientEmail || !recipientEmail.includes("@")) {
+    if (!/^VW-[0-9]{8}$/.test(recipientAccountId)) {
       return res.status(400).json({
-        error: "Valid recipient email is required"
+        error: "Valid recipient Vicky Account ID is required"
       });
     }
 
@@ -2978,27 +2978,27 @@ app.post("/wallet/transfer", auth, async (req, res) => {
       });
     }
 
-    const recipient = await db.prepare(`
-      SELECT id, account_id, full_name, email, currency
-      FROM users
-      WHERE lower(email) = lower(?)
-      LIMIT 1
-    `).get(recipientEmail);
-
-    if (!recipient) {
-      return res.status(404).json({
-        error: "Recipient not found"
+    if (recipientAccountId === req.user.account_id) {
+      return res.status(400).json({
+        error: "You cannot transfer to yourself"
       });
     }
 
-    if (recipient.id === req.user.id) {
-      return res.status(400).json({
-        error: "You cannot send money to yourself"
+    const recipient = await db.prepare(`
+      SELECT id, account_id, full_name, currency
+      FROM users
+      WHERE account_id = ?
+      LIMIT 1
+    `).get(recipientAccountId);
+
+    if (!recipient) {
+      return res.status(404).json({
+        error: "Recipient Vicky Account ID not found"
       });
     }
 
     const sender = await db.prepare(`
-      SELECT id, account_id, full_name, email, balance, currency
+      SELECT id, account_id, full_name, balance, currency
       FROM users
       WHERE id = ?
       LIMIT 1
@@ -3010,45 +3010,50 @@ app.post("/wallet/transfer", auth, async (req, res) => {
       });
     }
 
-    if (
-      String(sender.currency).toUpperCase() !==
-      String(recipient.currency).toUpperCase()
-    ) {
+    const senderCurrency =
+      String(sender.currency || "").trim().toUpperCase();
+
+    const recipientCurrency =
+      String(recipient.currency || "").trim().toUpperCase();
+
+    if (senderCurrency !== recipientCurrency) {
       return res.status(400).json({
         error:
-          `Currency mismatch. Your wallet is ${sender.currency}, ` +
-          `but the recipient wallet is ${recipient.currency}. ` +
+          `Currency mismatch. Your wallet is ${senderCurrency}, ` +
+          `but the recipient wallet is ${recipientCurrency}. ` +
           "Exchange currency before sending."
       });
     }
 
     const description = String(
-      req.body?.description || "Wallet transfer"
+      req.body?.description || "Vicky Pay transfer"
     ).trim();
 
     const result = await moveWalletFunds({
       senderId: sender.id,
       recipientId: recipient.id,
       amount: value,
-      description: description || "Wallet transfer",
-      currency: sender.currency
+      description: description || "Vicky Pay transfer",
+      currency: senderCurrency
     });
 
-    createNotification({
-      userId: sender.id,
-      type: "transfer_sent",
-      title: "Money sent",
-      message:
-        `You sent ${value} ${sender.currency} to ${recipient.full_name}.`
-    });
+    await Promise.all([
+      createNotification({
+        userId: sender.id,
+        type: "transfer_sent",
+        title: "Money sent",
+        message:
+          `You sent ${value} ${senderCurrency} to ${recipient.full_name}.`
+      }),
 
-    createNotification({
-      userId: recipient.id,
-      type: "transfer_received",
-      title: "Money received",
-      message:
-        `You received ${value} ${sender.currency} from ${sender.full_name}.`
-    });
+      createNotification({
+        userId: recipient.id,
+        type: "transfer_received",
+        title: "Money received",
+        message:
+          `You received ${value} ${senderCurrency} from ${sender.full_name}.`
+      })
+    ]);
 
     const updatedSender = await db.prepare(`
       SELECT balance, currency
@@ -3059,32 +3064,23 @@ app.post("/wallet/transfer", auth, async (req, res) => {
     return res.status(201).json({
       message: "Transfer successful",
       transaction_id: result.transaction_id,
+      received_transaction_id: result.received_transaction_id,
       balance: Number(updatedSender.balance),
       currency: updatedSender.currency,
       recipient: {
+        account_id: recipient.account_id,
         full_name: recipient.full_name,
-        email: recipient.email,
         currency: recipient.currency
       },
       amount: value,
       status: "completed"
     });
+
   } catch (error) {
     console.error("Wallet transfer error:", error);
 
-    const message = error.message || "Transfer failed";
-
-    if (
-      message === "Insufficient balance" ||
-      message === "You cannot transfer to yourself"
-    ) {
-      return res.status(400).json({
-        error: message
-      });
-    }
-
     return res.status(400).json({
-      error: message
+      error: error.message || "Transfer failed"
     });
   }
 });
