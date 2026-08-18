@@ -1759,7 +1759,7 @@ app.post ("/payments/webhook/flutterwave", async (req, res) => {
       .digest("hex");
 
     if (
-      webhookService.alreadyProcessed(
+      await webhookService.alreadyProcessed(
         "flutterwave",
         eventId
       )
@@ -1770,7 +1770,7 @@ app.post ("/payments/webhook/flutterwave", async (req, res) => {
       });
     }
 
-    webhookService.recordWebhook({
+    await webhookService.recordWebhook({
       id: id(),
       provider: "flutterwave",
       eventId: eventId || null,
@@ -1995,7 +1995,7 @@ app.post ("/payments/deposit", auth, async (req, res) => {
 
     const provider = paymentService.getProvider(providerName);
 
-    const payment = paymentService.createPaymentIntent({
+    const payment = await paymentService.createPaymentIntent({
       userId: req.user.id,
       provider: providerName,
       amount: value,
@@ -2058,7 +2058,7 @@ app.post ("/payments/deposit", auth, async (req, res) => {
           : null
       });
     } catch (providerError) {
-      paymentService.updateStatus(
+      await paymentService.updateStatus(
         payment.id,
         "failed"
       );
@@ -2463,7 +2463,7 @@ app.post ("/wallet/withdraw", auth, async (req, res) => {
      * Create the payment intent and reserve the wallet balance
      * atomically before contacting Flutterwave.
      */
-    const payment = paymentService.createPaymentIntent({
+    const payment = await paymentService.createPaymentIntent({
       userId: user.id,
       provider: "flutterwave",
       amount: value,
@@ -2561,7 +2561,7 @@ app.post ("/wallet/withdraw", auth, async (req, res) => {
         await db.exec("ROLLBACK");
       } catch {}
 
-      paymentService.updateStatus(
+      await paymentService.updateStatus(
         payment.id,
         "failed"
       );
@@ -2586,13 +2586,13 @@ app.post ("/wallet/withdraw", auth, async (req, res) => {
             process.env.PAYMENT_REDIRECT_URL || ""
         });
 
-      paymentService.setProviderReference(
+      await paymentService.setProviderReference(
         payment.id,
         payout.provider_reference
       );
 
       const updated =
-        paymentService.getPaymentIntent(payment.id);
+        await paymentService.getPaymentIntent(payment.id);
 
       /*
        * If Flutterwave already returned a terminal successful
@@ -2608,7 +2608,7 @@ app.post ("/wallet/withdraw", auth, async (req, res) => {
       }
 
       const finalPayment =
-        paymentService.getPaymentIntent(payment.id);
+        await paymentService.getPaymentIntent(payment.id);
 
       const updatedUser = await db.prepare(`
         SELECT balance, currency
@@ -2663,7 +2663,7 @@ app.post ("/wallet/withdraw", auth, async (req, res) => {
         await db.exec("BEGIN");
 
         const currentPayment =
-          paymentService.getPaymentIntent(payment.id);
+          await paymentService.getPaymentIntent(payment.id);
 
         if (
           currentPayment &&
@@ -2842,7 +2842,7 @@ app.get ("/wallet/withdraw/:paymentId", auth, async (req, res) => {
     }
 
     const updated =
-      paymentService.getPaymentIntent(payment.id);
+      await paymentService.getPaymentIntent(payment.id);
 
     return res.json({
       payment: updated

@@ -10,7 +10,9 @@ export class PaymentService {
     const provider = this.providers[name];
 
     if (!provider) {
-      throw new Error(`Payment provider "${name}" is not configured`);
+      throw new Error(
+        `Payment provider "${name}" is not configured`
+      );
     }
 
     return provider;
@@ -22,7 +24,7 @@ export class PaymentService {
       amount <= 100000000;
   }
 
-  createPaymentIntent({
+  async createPaymentIntent({
     userId,
     provider,
     amount,
@@ -38,7 +40,9 @@ export class PaymentService {
       throw new Error("Invalid payment type");
     }
 
-    currency = String(currency || "").trim().toUpperCase();
+    currency = String(currency || "")
+      .trim()
+      .toUpperCase();
 
     if (!/^[A-Z]{3}$/.test(currency)) {
       throw new Error("Invalid currency");
@@ -47,7 +51,7 @@ export class PaymentService {
     const paymentId = crypto.randomUUID();
     const timestamp = new Date().toISOString();
 
-    this.db.prepare(`
+    await this.db.prepare(`
       INSERT INTO payment_intents
       (
         id,
@@ -70,32 +74,37 @@ export class PaymentService {
       currency,
       type,
       description ||
-        (type === "withdrawal"
-          ? "Wallet withdrawal"
-          : "Wallet deposit"),
+        (
+          type === "withdrawal"
+            ? "Wallet withdrawal"
+            : "Wallet deposit"
+        ),
       timestamp,
       timestamp
     );
 
-    return this.getPaymentIntent(paymentId);
+    return await this.getPaymentIntent(paymentId);
   }
 
-  getPaymentIntent(paymentId) {
-    return this.db.prepare(`
+  async getPaymentIntent(paymentId) {
+    return await this.db.prepare(`
       SELECT *
       FROM payment_intents
       WHERE id = ?
     `).get(paymentId);
   }
 
-  setProviderReference(paymentId, providerReference) {
+  async setProviderReference(
+    paymentId,
+    providerReference
+  ) {
     if (!providerReference) {
       throw new Error("Provider reference is required");
     }
 
     const updatedAt = new Date().toISOString();
 
-    this.db.prepare(`
+    await this.db.prepare(`
       UPDATE payment_intents
       SET provider_reference = ?,
           status = 'processing',
@@ -107,10 +116,10 @@ export class PaymentService {
       paymentId
     );
 
-    return this.getPaymentIntent(paymentId);
+    return await this.getPaymentIntent(paymentId);
   }
 
-  updateStatus(paymentId, status) {
+  async updateStatus(paymentId, status) {
     const allowed = [
       "pending",
       "processing",
@@ -125,7 +134,7 @@ export class PaymentService {
 
     const updatedAt = new Date().toISOString();
 
-    this.db.prepare(`
+    await this.db.prepare(`
       UPDATE payment_intents
       SET status = ?,
           updated_at = ?
@@ -136,6 +145,6 @@ export class PaymentService {
       paymentId
     );
 
-    return this.getPaymentIntent(paymentId);
+    return await this.getPaymentIntent(paymentId);
   }
 }

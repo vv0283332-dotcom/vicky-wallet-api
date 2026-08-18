@@ -3,20 +3,21 @@ export class WebhookService {
     this.db = db;
   }
 
-  alreadyProcessed(provider, eventId) {
+  async alreadyProcessed(provider, eventId) {
     if (!eventId) return false;
 
-    const row = this.db.prepare(`
-      SELECT id
+    const row = await this.db.prepare(`
+      SELECT id, processed
       FROM payment_webhooks
-      WHERE provider = ? AND provider_event_id = ?
+      WHERE provider = ?
+        AND provider_event_id = ?
       LIMIT 1
     `).get(provider, eventId);
 
     return Boolean(row);
   }
 
-  recordWebhook({
+  async recordWebhook({
     id,
     provider,
     eventId,
@@ -25,7 +26,7 @@ export class WebhookService {
   }) {
     const createdAt = new Date().toISOString();
 
-    this.db.prepare(`
+    await this.db.prepare(`
       INSERT INTO payment_webhooks
       (
         id,
@@ -36,7 +37,8 @@ export class WebhookService {
         processed,
         created_at
       )
-      VALUES (?, ?, ?, ?, ?, 0, ?)
+      VALUES (?, ?, ?, ?, ?, FALSE, ?)
+      ON CONFLICT DO NOTHING
     `).run(
       id,
       provider,
